@@ -33,6 +33,7 @@ DEFAULT_CREW = {
         {"name": "reviewer", "command": BACKENDS["claude"], "role": "Reviews work for bugs and gaps"},
     ],
 }
+PLAN_FORMAT = '[{"worker": "<name>", "role": "<role>", "task": "<task>", "step": 1}]'
 NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,23}$")
 ICONS = {"idle": "[dim]○[/]", "working": "[yellow]◐[/]", "done": "[green]●[/]", "failed": "[red]✗[/]"}
 
@@ -62,19 +63,32 @@ def manager_prompt(goal: str, workers: list[dict]) -> str:
         "Pick the workers you need, give each a specific role for this goal and a "
         "concrete task. Tasks with the same step run in parallel; a later step sees "
         "the output of earlier steps (e.g. review after writing). "
-        "Reply with ONLY a JSON array, no prose:\n"
-        '[{"worker": "<name>", "role": "<role>", "task": "<task>", "step": 1}]'
+        f"Reply with ONLY a JSON array, no prose:\n{PLAN_FORMAT}"
     )
 
 
+def review_prompt(goal: str, report: str, last_round: bool) -> str:
+    ask = ("This was the last round: give a final summary of what got done and what is left."
+           if last_round else
+           "If the goal is fully met, say so and include no JSON. Otherwise end your reply with "
+           f"a JSON array assigning the next round of work, in this format:\n{PLAN_FORMAT}")
+    return (f"Goal: {goal}\n\nYour workers reported:\n{report}\n\n"
+            f"Review their work: what got done and what is missing. {ask}")
+
+
 def parse_plan(text: str, names: set[str]) -> list[dict]:
-    """Pull the JSON array out of the manager's reply; keep known workers, default step 1."""
-    start, end = text.find("["), text.rfind("]")
-    if start < 0 or end < start:
+    """Pull the JSON array ending the manager's reply; keep known workers, default step 1."""
+    end = text.rfind("]")
+    # the outermost array is the first "[" that parses through to the final "]"
+    for start in (i for i, c in enumerate(text[:end]) if c == "["):
+        try:
+            plan = json.loads(text[start:end + 1])
+            break
+        except json.JSONDecodeError:
+            continue
+    else:
         return []
-    try:
-        plan = json.loads(text[start:end + 1])
-    except json.JSONDecodeError:
+    if not isinstance(plan, list):
         return []
     plan = [p for p in plan if isinstance(p, dict) and p.get("worker") in names and p.get("task")]
     for p in plan:
@@ -130,6 +144,7 @@ class Foreman(App):
     BINDINGS = [
         Binding("ctrl+n", "add_worker", "Add worker"),
         Binding("ctrl+r", "remove_worker", "Remove worker"),
+        Binding("ctrl+s", "stop", "Stop"),
         Binding("ctrl+t", "next_theme", "Theme"),
         Binding("ctrl+q", "quit", "Quit"),
     ]
@@ -140,6 +155,7 @@ class Foreman(App):
         self.agents = {a["name"]: a for a in [self.crew["manager"], *self.crew["workers"]]}
         self.roles: dict[str, str] = {}  # roles the manager handed out this run
         self.busy = False
+        self.stopping = False
 
     # ---- layout -------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -204,6 +220,11 @@ class Foreman(App):
         self.query_one("#main", TabbedContent).remove_pane(f"tab-{name}")
         self.notify(f"Removed {name}")
 
+    def action_stop(self) -> None:
+        if self.busy:
+            self.stopping = True
+            self.notify("Stopping after the running agents finish", severity="warning")
+
     def action_next_theme(self) -> None:
         themes = list(self.available_themes)
         self.theme = themes[(themes.index(self.theme) + 1) % len(themes)]
@@ -256,33 +277,51 @@ class Foreman(App):
         finally:
             self.busy = False
 
+    async def run_plan(self, goal: str, plan: list[dict], report: str) -> str:
+        """Run one round step by step; return the report with this round's output added."""
+        for step in sorted({p["step"] for p in plan}):
+            if self.stopping:
+                break
+            batch = [p for p in plan if p["step"] == step]
+            # ponytail: only the last 12k chars of history go to workers; summarise rounds if that loses context
+            earlier = f"\n\nWork done so far by the team:\n{report[-12000:]}" if report else ""
+            results = await asyncio.gather(*[
+                self.run_agent(p["worker"], f"Your role: {p.get('role', '')}\nTeam goal: {goal}\n\n"
+                                            f"Your task: {p['task']}{earlier}")
+                for p in batch
+            ])
+            report += "".join(f"\n## {p['worker']} ({p.get('role', '')})\n{r[-6000:]}\n" for p, r in zip(batch, results))
+        return report
+
+    def show_plan(self, boss: str, rnd: int, plan: list[dict]) -> None:
+        self.log_to(boss, f"\n[b magenta]Round {rnd} assignments[/]")
+        for p in plan:
+            self.roles[p["worker"]] = p.get("role", "")
+            self.set_state(p["worker"], "idle")
+            self.log_to(boss, f"  [dim]step {p['step']}[/] [b]{p['worker']}[/] as [i]{p.get('role', '?')}[/]: {p['task']}")
+
     async def orchestrate(self, goal: str) -> None:
         boss = self.crew["manager"]["name"]
+        names = {w["name"] for w in self.crew["workers"]}
+        max_rounds = self.crew.get("max_rounds", 3)
         tabs = self.query_one("#main", TabbedContent)
+        self.stopping = False
         try:
             tabs.active = f"tab-{boss}"
-            reply = await self.run_agent(boss, manager_prompt(goal, self.crew["workers"]))
-            plan = parse_plan(reply, {w["name"] for w in self.crew["workers"]})
+            plan = parse_plan(await self.run_agent(boss, manager_prompt(goal, self.crew["workers"])), names)
             if not plan:
                 return self.log_to(boss, "[red]No usable plan in the manager's reply.[/]")
-            self.log_to(boss, "\n[b magenta]Assignments[/]")
-            for p in plan:
-                self.roles[p["worker"]] = p.get("role", "")
-                self.log_to(boss, f"  [dim]step {p['step']}[/] [b]{p['worker']}[/] as [i]{p.get('role', '?')}[/]: {p['task']}")
-            report = ""
-            for step in sorted({p["step"] for p in plan}):
-                batch = [p for p in plan if p["step"] == step]
-                earlier = f"\n\nWork done so far by your teammates:\n{report}" if report else ""
-                results = await asyncio.gather(*[
-                    self.run_agent(p["worker"], f"Your role: {p.get('role', '')}\nTeam goal: {goal}\n\n"
-                                                f"Your task: {p['task']}{earlier}")
-                    for p in batch
-                ])
-                # ponytail: last 6k chars per worker keeps prompts sane; summarise per worker if outputs get huge
-                report += "".join(f"\n## {p['worker']} ({p.get('role', '')})\n{r[-6000:]}\n" for p, r in zip(batch, results))
-            tabs.active = f"tab-{boss}"
-            await self.run_agent(boss, f"Goal: {goal}\n\nYour workers reported:\n\n{report}\n\n"
-                                       "Review their work: what got done, what is missing, and the next steps.")
+            report, rnd = "", 1
+            while plan:
+                self.show_plan(boss, rnd, plan)
+                report = await self.run_plan(goal, plan, report + f"\n# Round {rnd}\n")
+                if self.stopping:
+                    return self.log_to(boss, f"\n[yellow]Stopped during round {rnd}.[/]")
+                tabs.active = f"tab-{boss}"
+                review = await self.run_agent(boss, review_prompt(goal, report[-24000:], rnd >= max_rounds))
+                plan = [] if rnd >= max_rounds else parse_plan(review, names)
+                rnd += 1
+            self.log_to(boss, f"\n[b green]Done after {rnd - 1} round(s).[/]")
             self.notify("Crew finished", title="foreman")
         finally:
             self.busy = False
