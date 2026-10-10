@@ -1,35 +1,37 @@
 //! Config, prompts, and the plan → work → review loop. No UI here.
 //!
 //! The manager invents its workers per job: each plan entry names a worker, a
-//! role and a task, and every worker is a fresh run of the `worker` command.
+//! role, a task, and the files it owns. Workers in a step run in parallel
+//! unless they claim the same file; foreman records which files each step
+//! actually changed and reports that, and each worker's report, to the manager.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
-/// The manager is Claude with read-only tools: it can look around but not do the work.
-/// stream-json lets the UI show it thinking, reading files, and writing its reply live.
-/// (`--tools=` needs the "=": the flag takes several values and would swallow the prompt.)
-pub const MANAGER_COMMAND: &str =
-    "claude -p --output-format stream-json --verbose --include-partial-messages --tools=Read,Grep,Glob {prompt}";
-/// `--thinking` puts the worker's reasoning in its output, so you and the manager can both read it.
-pub const WORKER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --auto --thinking {prompt}";
+/// The manager is Claude with read-only tools: it can look around and check work, but not do it.
+/// JSON output carries its token usage. (`--tools=` needs the "=": the flag takes several
+/// values and would swallow the prompt.)
+pub const MANAGER_COMMAND: &str = "claude -p --output-format json --tools=Read,Grep,Glob {prompt}";
+/// opencode's JSON events carry each action, the reply, and token usage per step.
+pub const WORKER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --auto --format json {prompt}";
 pub const CLAUDE_MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
-const PLAN_FORMAT: &str = r#"[{"worker": "<short-name>", "role": "<role>", "task": "<task>", "step": 1}]"#;
+const PLAN_FORMAT: &str = r#"[{"worker": "<short-name>", "role": "<role>", "task": "<task>", "files": ["<file it may create or edit>"], "step": 1}]"#;
 
 pub fn manager_command(model: &str) -> String {
-    MANAGER_COMMAND.replacen("claude -p", &format!("claude -p --model {model}"), 1)
+    format!("claude -p --model {model} --output-format json --tools=Read,Grep,Glob {{prompt}}")
 }
 
 pub fn worker_command(model: &str) -> String {
-    format!("opencode run -m {model} --auto --thinking {{prompt}}")
+    format!("opencode run -m {model} --auto --format json {{prompt}}")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -112,23 +114,35 @@ pub enum State {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     User,
-    Think, // the manager's live activity: files it reads, searches it runs
-    Rule,  // a section divider, e.g. "Round 1 · 2 workers"
+    Rule, // a section divider, e.g. "Round 1 · 2 workers"
     Out,
     Good,
     Warn,
     Bad,
 }
 
+/// Tokens an agent used (input includes cached input) and what its CLI says it cost.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub cost: f64,
+}
+
+impl std::ops::AddAssign for Usage {
+    fn add_assign(&mut self, o: Usage) {
+        (self.input, self.output, self.cost) = (self.input + o.input, self.output + o.output, self.cost + o.cost);
+    }
+}
+
 #[derive(Debug)]
 pub enum Msg {
     Log(Kind, String),
     Manager(State),
-    Thinking(u64),       // the manager is thinking; roughly this many more tokens
-    ManagerText(String), // a chunk of the manager's reply as it's written
-    Assign(Task),                  // the manager handed out a task (the worker is queued)
-    Worker(String, State),         // name, state
-    Output(String, String),        // a worker's output line: name, line
+    Assign(Task),           // the manager handed out a task (the worker is queued)
+    Worker(String, State),  // name, state
+    Output(String, String), // a worker's output line: name, line
+    Usage(String, Usage),   // more tokens used by "manager" or a worker
     Notify(String),
     /// A user/manager exchange to keep as conversation history.
     Remember(String),
@@ -140,6 +154,7 @@ pub struct Task {
     pub worker: String,
     pub role: String,
     pub task: String,
+    pub files: Vec<String>, // files this worker may create or edit
     pub step: i64,
 }
 
@@ -163,13 +178,15 @@ pub fn manager_prompt(message: &str, history: &str) -> String {
         "You are the manager of a team of AI agents working in the current directory. You do not do \
          the work yourself and you do not use tools to write, edit or run anything. Instead you create \
          workers as needed: each worker is a fresh AI agent that can read and write files and run \
-         commands here. You give each one a short name, a role and a concrete, self-contained task.\n\n\
+         commands here. You give each one a short name, a role, a concrete self-contained task, and the \
+         list of files it owns: the only files it may create or edit. You keep track of who owns what.\n\n\
          {history}The user says: {message}\n\n\
          If this needs any work done (code, files, research, writing, checking), reply with ONLY a JSON \
-         array creating the workers, no prose. Use as few workers as the job needs. Tasks with the same \
-         step run in parallel; a later step sees the output of earlier steps, so anything that checks \
-         work (review, testing) must have a higher step than the work it checks. Never give two workers in \
-         the same step the same file to edit; they would overwrite each other:\n{PLAN_FORMAT}\n\n\
+         array creating the workers, no prose. Use as few workers as the job needs, and run them in \
+         parallel where you can. Tasks with the same step run in parallel; a later step sees the reports \
+         of earlier steps, so anything that checks work (review, testing) must have a higher step than the \
+         work it checks. Two workers in the same step must never own the same file; give each its own \
+         files (a worker that only reads or runs things owns none):\n{PLAN_FORMAT}\n\n\
          Only if it is a quick question or chat that needs no work, answer it yourself in plain text \
          with no JSON."
     )
@@ -186,10 +203,12 @@ pub fn review_prompt(goal: &str, report: &str, last_round: bool) -> String {
         )
     };
     format!(
-        "Goal: {goal}\n\nYour workers reported (including their reasoning):\n{report}\n\n\
-         Review their work. Don't take their word for it: use your read tools to check the actual files \
-         they made or changed, and look for mistakes in their reasoning, files they overwrote, and claims \
-         that don't match the files. Do not fix anything yourself; create workers to fix it. {ask}"
+        "Goal: {goal}\n\nYour workers' reports, with foreman's record of which files each step really \
+         changed:\n{report}\n\n\
+         Review their work. Don't take their word for it: use your read tools to check the actual files, \
+         and look for mistakes, files changed by a worker that didn't own them, work that overwrote other \
+         work, and claims that don't match the files. Do not fix anything yourself; create workers to fix \
+         it. {ask}"
     )
 }
 
@@ -210,6 +229,7 @@ pub fn split_plan(text: &str) -> (String, Vec<Task>) {
             worker: field(v, "worker").chars().filter(|c| c.is_alphanumeric() || "-_".contains(*c)).take(20).collect(),
             role: field(v, "role"),
             task: field(v, "task"),
+            files: v["files"].as_array().into_iter().flatten().filter_map(Value::as_str).map(clean_path).collect(),
             step: v.get("step").and_then(Value::as_i64).unwrap_or(1),
         })
         .filter(|t| !t.worker.is_empty() && !t.task.is_empty())
@@ -219,6 +239,73 @@ pub fn split_plan(text: &str) -> (String, Vec<Task>) {
     }
     let prose = text[..start].trim().trim_end_matches("```json").trim_end_matches("```").trim();
     (prose.to_string(), plan)
+}
+
+/// "./src/a.rs" and "src/a.rs" are the same file.
+fn clean_path(p: &str) -> String {
+    p.trim().trim_start_matches("./").to_string()
+}
+
+/// Split a step into groups that can run in parallel: no two tasks in a group own the same file.
+fn conflict_free<'a>(batch: &[&'a Task]) -> Vec<Vec<&'a Task>> {
+    let mut groups: Vec<Vec<&Task>> = vec![];
+    for &t in batch {
+        let clash = |g: &Vec<&Task>| g.iter().any(|o| o.files.iter().any(|f| t.files.contains(f)));
+        match groups.iter_mut().find(|g| !clash(g)) {
+            Some(g) => g.push(t),
+            None => groups.push(vec![t]),
+        }
+    }
+    groups
+}
+
+/// Every file under `dir` with its size and modified time; skips VCS, build and dependency folders.
+pub fn snapshot(dir: &Path) -> HashMap<String, (u64, SystemTime)> {
+    const SKIP: [&str; 8] = [".git", "target", "node_modules", ".venv", "venv", "__pycache__", "dist", "build"];
+    // ponytail: a full walk per step, capped; switch to git status or a watcher for huge trees
+    const MAX: usize = 20_000;
+    let mut files = HashMap::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let Ok(meta) = e.metadata() else { continue };
+            if meta.is_dir() {
+                if !SKIP.contains(&name.as_str()) && !name.starts_with('.') {
+                    stack.push(e.path());
+                }
+            } else if files.len() < MAX {
+                let rel = e.path().strip_prefix(dir).unwrap_or(&e.path()).to_string_lossy().to_string();
+                files.insert(rel, (meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+            }
+        }
+    }
+    files
+}
+
+/// Files added, changed or deleted between two snapshots, sorted.
+pub fn changed(before: &HashMap<String, (u64, SystemTime)>, after: &HashMap<String, (u64, SystemTime)>) -> Vec<String> {
+    let mut out: Vec<String> = after.iter().filter(|(f, v)| before.get(*f) != Some(v)).map(|(f, _)| f.clone()).collect();
+    out.extend(before.keys().filter(|f| !after.contains_key(*f)).cloned());
+    out.sort();
+    out
+}
+
+/// Who owned each changed file: (lines for the chat, files nobody owned).
+fn attribute(files: &[String], group: &[&Task]) -> (String, Vec<String>) {
+    let mut parts = vec![];
+    let mut unowned = vec![];
+    for f in files {
+        let owners: Vec<&str> = group.iter().filter(|t| t.files.contains(f)).map(|t| t.worker.as_str()).collect();
+        if owners.is_empty() {
+            unowned.push(f.clone());
+            parts.push(format!("{f} (no owner)"));
+        } else {
+            parts.push(format!("{f} ({})", owners.join(", ")));
+        }
+    }
+    (parts.join(" · "), unowned)
 }
 
 fn tail(s: &str, max: usize) -> &str {
@@ -270,25 +357,84 @@ pub fn opencode_models() -> Result<Vec<(String, &'static str)>, String> {
     if models.is_empty() { Err("opencode listed no models".into()) } else { Ok(models) }
 }
 
-/// Run a CLI agent to completion, handing each output line to `on_line`; kill it if it
-/// goes quiet for longer than `idle`. Return (ok, all output with escapes stripped).
-pub async fn run_command(command: &str, prompt: &str, idle: Option<Duration>, on_line: impl Fn(&str)) -> (bool, String) {
+/// What one line of an agent CLI's output means. Plain text passes through; the JSON
+/// formats of `claude -p --output-format json` and `opencode run --format json` are decoded.
+#[derive(Debug, PartialEq)]
+pub enum Event {
+    Lines(Vec<String>),
+    Usage(Usage),
+    /// claude's final answer: (text, is_error, usage).
+    Result(String, bool, Usage),
+}
+
+pub fn parse_event(line: &str) -> Event {
+    let Ok(v) = serde_json::from_str::<Value>(line) else { return Event::Lines(vec![line.to_string()]) };
+    let n = |v: &Value| v.as_u64().unwrap_or(0);
+    match v["type"].as_str() {
+        Some("result") => {
+            let u = &v["usage"];
+            let usage = Usage {
+                input: n(&u["input_tokens"]) + n(&u["cache_creation_input_tokens"]) + n(&u["cache_read_input_tokens"]),
+                output: n(&u["output_tokens"]),
+                cost: v["total_cost_usd"].as_f64().unwrap_or(0.0),
+            };
+            Event::Result(v["result"].as_str().unwrap_or_default().to_string(), v["is_error"].as_bool().unwrap_or(false), usage)
+        }
+        Some("step_finish") => {
+            let t = &v["part"]["tokens"];
+            Event::Usage(Usage {
+                input: n(&t["input"]) + n(&t["cache"]["read"]) + n(&t["cache"]["write"]),
+                output: n(&t["output"]) + n(&t["reasoning"]),
+                cost: v["part"]["cost"].as_f64().unwrap_or(0.0),
+            })
+        }
+        Some("text") => Event::Lines(v["part"]["text"].as_str().unwrap_or_default().lines().map(String::from).collect()),
+        Some("tool_use") => {
+            let part = &v["part"];
+            let tool = part["tool"].as_str().unwrap_or("tool");
+            let mut name = tool.to_string();
+            name[..1].make_ascii_uppercase();
+            let input = &part["state"]["input"];
+            let arg = ["filePath", "path", "command", "pattern", "url", "query"].iter().find_map(|k| input[*k].as_str()).unwrap_or("");
+            let mut lines = vec![format!("⚙ {name} {}", arg.lines().next().unwrap_or("")).trim_end().to_string()];
+            if part["state"]["status"] == "error" {
+                lines.push(format!("Error: {}", part["state"]["error"].as_str().unwrap_or("tool failed")));
+            }
+            Event::Lines(lines)
+        }
+        Some(_) => Event::Lines(vec![]), // step_start, reasoning, …: nothing to show
+        None => Event::Lines(vec![line.to_string()]),
+    }
+}
+
+/// Run a CLI agent to completion, handing each output line to `on_line` and each usage update
+/// to `on_usage`; kill it if it goes quiet for longer than `idle`.
+/// Returns (ok, output as text, total usage).
+pub async fn run_command(
+    command: &str,
+    prompt: &str,
+    dir: &Path,
+    idle: Option<Duration>,
+    on_line: impl Fn(&str),
+    on_usage: impl Fn(Usage),
+) -> (bool, String, Usage) {
     let Some(argv) = build_argv(command, prompt) else {
-        return (false, format!("bad command: {command}"));
+        return (false, format!("bad command: {command}"), Usage::default());
     };
     // sh only merges stderr into stdout; the argv goes through "$@" untouched.
     let child = Command::new("sh")
         .args(["-c", "exec \"$@\" 2>&1", "sh"])
         .args(&argv)
+        .current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .kill_on_drop(true)
         .spawn();
     let mut child = match child {
         Ok(child) => child,
-        Err(e) => return (false, e.to_string()),
+        Err(e) => return (false, e.to_string(), Usage::default()),
     };
-    let mut out = String::new();
+    let (mut out, mut usage, mut result, mut errored) = (String::new(), Usage::default(), None, false);
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut buf = Vec::new();
     loop {
@@ -300,29 +446,64 @@ pub async fn run_command(command: &str, prompt: &str, idle: Option<Duration>, on
                 Err(_) => {
                     child.kill().await.ok();
                     out.push_str(&format!("no output for {}s, stopped\n", limit.as_secs()));
-                    return (false, out);
+                    return (false, out, usage);
                 }
             },
         };
         if n == 0 {
             break;
         }
-        let line = strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    ");
-        on_line(&line);
-        out.push_str(&line);
-        out.push('\n');
+        let raw = strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    ");
         buf.clear();
+        match parse_event(&raw) {
+            Event::Lines(lines) => {
+                for line in lines {
+                    on_line(&line);
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+            }
+            Event::Usage(u) => {
+                usage += u;
+                on_usage(u);
+            }
+            Event::Result(text, is_error, u) => {
+                (usage, errored) = (Usage { input: usage.input + u.input, output: usage.output + u.output, cost: usage.cost + u.cost }, is_error);
+                on_usage(u);
+                result = Some(text);
+            }
+        }
     }
+    let out = result.unwrap_or(out);
     match child.wait().await {
-        Ok(status) if status.success() => (true, out),
-        Ok(status) => (false, format!("{out}exited with {status}")),
-        Err(e) => (false, format!("{out}{e}")),
+        Ok(status) if status.success() && !errored => (true, out, usage),
+        Ok(status) => (false, format!("{out}\nexited with {status}"), usage),
+        Err(e) => (false, format!("{out}\n{e}"), usage),
     }
 }
 
-/// Run one round step by step; append this round's output to the report.
+fn worker_prompt(t: &Task, goal: &str, earlier: &str) -> String {
+    let files = if t.files.is_empty() {
+        "You own no files: do not create or edit any (reading and running things is fine).".to_string()
+    } else {
+        format!(
+            "Files you own: {}. Only create or edit these; other workers may be editing other files at \
+             the same time. If you need a change anywhere else, don't make it; say so in your report.",
+            t.files.join(", ")
+        )
+    };
+    format!(
+        "You are {}, a worker on an AI team run by a manager.\nYour role: {}\nTeam goal: {goal}\n\n\
+         Your task from the manager: {}\n\n{files}\n\n\
+         When you are done, end with a short report to the manager: what you did, which files you \
+         changed, and anything you could not do or that needs another worker.{earlier}",
+        t.worker, t.role, t.task
+    )
+}
+
+/// Run one round step by step; append each worker's report and the file changes to `report`.
 /// Dropping this future (when the user stops the job) aborts the workers, which kills their processes.
-async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, tx: &UnboundedSender<Msg>) {
+async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], dir: &Path, report: &mut String, tx: &UnboundedSender<Msg>) {
     let mut steps: Vec<i64> = plan.iter().map(|t| t.step).collect();
     steps.sort();
     steps.dedup();
@@ -331,107 +512,62 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
     let idle = Some(Duration::from_secs(crew.worker_idle_mins.max(1) * 60));
     for step in steps {
         let batch: Vec<&Task> = plan.iter().filter(|t| t.step == step).collect();
-        // ponytail: only the last 12k chars of history go to workers; summarise rounds if that loses context
-        let earlier = if report.trim().is_empty() {
-            String::new()
-        } else {
-            format!("\n\nWork done so far by the team:\n{}", tail(report, 12_000))
-        };
-        let mut set = JoinSet::new();
-        for (i, t) in batch.iter().enumerate() {
-            let prompt = format!(
-                "You are {}, a worker on an AI team.\nYour role: {}\nTeam goal: {goal}\n\nYour task: {}{earlier}",
-                t.worker, t.role, t.task
-            );
-            let (command, tx, t, slots) = (crew.worker.clone(), tx.clone(), (*t).clone(), slots.clone());
-            set.spawn(async move {
-                let _slot = slots.acquire_owned().await;
-                tx.send(Msg::Worker(t.worker.clone(), State::Working)).ok();
-                let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
-                let (ok, out) = tokio::time::timeout(timeout, run_command(&command, &prompt, idle, echo))
-                    .await
-                    .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60)));
-                tx.send(Msg::Worker(t.worker.clone(), if ok { State::Done } else { State::Failed })).ok();
-                // success shows in the round's to-do list; a failure also gets a line saying why
-                if !ok {
-                    tx.send(Msg::Log(Kind::Bad, format!("{} failed: {}", t.worker, last_line(&out)))).ok();
-                }
-                (i, out)
-            });
+        let groups = conflict_free(&batch);
+        if groups.len() > 1 {
+            let msg = format!("Some step {step} workers own the same files, so they'll take turns instead of running together.");
+            tx.send(Msg::Log(Kind::Warn, msg)).ok();
         }
-        let mut outs = vec![String::new(); batch.len()];
-        while let Some(Ok((i, out))) = set.join_next().await {
-            outs[i] = out;
-        }
-        for (t, out) in batch.iter().zip(outs) {
-            report.push_str(&format!("\n## {} ({})\n{}\n", t.worker, t.role, tail(&out, 6_000)));
-        }
-    }
-}
-
-/// What one line of Claude's stream-json output means for the UI.
-#[derive(Debug, PartialEq)]
-pub enum Stream {
-    Thinking(u64),
-    Tool(String),
-    Text(String),
-}
-
-pub fn parse_stream(line: &str) -> Vec<Stream> {
-    let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
-    match v["type"].as_str() {
-        Some("stream_event") => {
-            let ev = &v["event"];
-            let item = match (ev["type"].as_str(), ev["delta"]["type"].as_str()) {
-                (Some("content_block_start"), _) if ev["content_block"]["type"] == "thinking" => Some(Stream::Thinking(0)),
-                (_, Some("thinking_delta")) => Some(Stream::Thinking(ev["delta"]["estimated_tokens"].as_u64().unwrap_or(0))),
-                (_, Some("text_delta")) => ev["delta"]["text"].as_str().map(|t| Stream::Text(t.into())),
-                _ => None,
+        for group in groups {
+            // ponytail: only the last 12k chars of history go to workers; summarise rounds if that loses context
+            let earlier = if report.trim().is_empty() {
+                String::new()
+            } else {
+                format!("\n\nReports from the team so far:\n{}", tail(report, 12_000))
             };
-            item.into_iter().collect()
+            let before = snapshot(dir);
+            let mut set = JoinSet::new();
+            for (i, t) in group.iter().enumerate() {
+                let prompt = worker_prompt(t, goal, &earlier);
+                let (command, tx, t, slots, dir) = (crew.worker.clone(), tx.clone(), (*t).clone(), slots.clone(), dir.to_path_buf());
+                set.spawn(async move {
+                    let _slot = slots.acquire_owned().await;
+                    tx.send(Msg::Worker(t.worker.clone(), State::Working)).ok();
+                    let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
+                    let count = |u: Usage| _ = tx.send(Msg::Usage(t.worker.clone(), u));
+                    let (ok, out, _) = tokio::time::timeout(timeout, run_command(&command, &prompt, &dir, idle, echo, count))
+                        .await
+                        .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60), Usage::default()));
+                    tx.send(Msg::Worker(t.worker.clone(), if ok { State::Done } else { State::Failed })).ok();
+                    if !ok {
+                        tx.send(Msg::Log(Kind::Bad, format!("{} failed: {}", t.worker, last_line(&out)))).ok();
+                    }
+                    (i, out)
+                });
+            }
+            let mut outs = vec![String::new(); group.len()];
+            while let Some(Ok((i, out))) = set.join_next().await {
+                outs[i] = out;
+            }
+            for (t, out) in group.iter().zip(outs) {
+                report.push_str(&format!("\n## {} ({}), owns: {}\n{}\n", t.worker, t.role, t.files.join(", "), tail(&out, 6_000)));
+            }
+            // the manager's ledger: which files really changed, and whether their owner did it
+            let files = changed(&before, &snapshot(dir));
+            if !files.is_empty() {
+                let (summary, unowned) = attribute(&files, &group);
+                let kind = if unowned.is_empty() { Kind::Good } else { Kind::Warn };
+                tx.send(Msg::Log(kind, format!("files changed: {summary}"))).ok();
+                report.push_str(&format!("\n[foreman] Files changed by these workers: {summary}\n"));
+            }
         }
-        Some("assistant") => v["message"]["content"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|b| b["type"] == "tool_use")
-            .map(|b| {
-                let arg = ["file_path", "pattern", "path", "query"].iter().find_map(|k| b["input"][*k].as_str()).unwrap_or("");
-                Stream::Tool(format!("{} {arg}", b["name"].as_str().unwrap_or("tool")).trim().to_string())
-            })
-            .collect(),
-        _ => vec![],
     }
-}
-
-/// The final answer in a stream-json transcript: (ok, text).
-pub fn stream_result(out: &str) -> Option<(bool, String)> {
-    out.lines().rev().find_map(|l| {
-        let v: Value = serde_json::from_str(l).ok()?;
-        (v["type"] == "result").then(|| (!v["is_error"].as_bool().unwrap_or(false), v["result"].as_str().unwrap_or("").to_string()))
-    })
 }
 
 /// Ask the manager; show its prose to the user and return (ok, prose, plan).
-async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (bool, String, Vec<Task>) {
+async fn ask_manager(crew: &Crew, prompt: &str, dir: &Path, tx: &UnboundedSender<Msg>) -> (bool, String, Vec<Task>) {
     tx.send(Msg::Manager(State::Working)).ok();
-    let streaming = crew.manager.contains("stream-json");
-    let cwd = std::env::current_dir().map(|d| format!("{}/", d.display())).unwrap_or_default();
-    let live = |line: &str| {
-        for item in parse_stream(line) {
-            let msg = match item {
-                Stream::Thinking(n) => Msg::Thinking(n),
-                Stream::Text(t) => Msg::ManagerText(t),
-                Stream::Tool(t) => Msg::Log(Kind::Think, format!("→ {}", t.replace(&cwd, ""))),
-            };
-            tx.send(msg).ok();
-        }
-    };
-    let (ok, out) = run_command(&crew.manager, prompt, None, live).await;
-    let (ok, reply) = match streaming.then(|| stream_result(&out)).flatten() {
-        Some((good, text)) => (ok && good, text),
-        None => (ok, out),
-    };
+    let count = |u: Usage| _ = tx.send(Msg::Usage("manager".into(), u));
+    let (ok, reply, _) = run_command(&crew.manager, prompt, dir, None, |_| (), count).await;
     tx.send(Msg::Manager(if ok { State::Done } else { State::Failed })).ok();
     if !ok {
         tx.send(Msg::Log(Kind::Bad, format!("The manager failed: {}", last_line(&reply)))).ok();
@@ -446,8 +582,13 @@ async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (b
 
 /// Plan, run the workers, review, and re-plan until the manager is satisfied or rounds run out.
 pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: UnboundedSender<Msg>) {
+    let dir = std::env::current_dir().unwrap_or_default();
+    orchestrate_in(crew, goal, history, &dir, tx).await;
+}
+
+async fn orchestrate_in(crew: Crew, goal: String, history: String, dir: &Path, tx: UnboundedSender<Msg>) {
     let log = |kind, text: String| tx.send(Msg::Log(kind, text)).ok();
-    let (ok, prose, mut plan) = ask_manager(&crew, &manager_prompt(&goal, &history), &tx).await;
+    let (ok, prose, mut plan) = ask_manager(&crew, &manager_prompt(&goal, &history), dir, &tx).await;
     if ok && plan.is_empty() {
         tx.send(Msg::Remember(format!("User: {goal}\nManager: {}", tail(&prose, 1_500)))).ok();
     }
@@ -460,9 +601,9 @@ pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: Unbounde
             tx.send(Msg::Assign(t.clone())).ok();
         }
         report.push_str(&format!("\n# Round {round}\n"));
-        run_plan(&crew, &goal, &plan, &mut report, &tx).await;
+        run_plan(&crew, &goal, &plan, dir, &mut report, &tx).await;
         let last = round >= crew.max_rounds;
-        let (ok, summary, next) = ask_manager(&crew, &review_prompt(&goal, tail(&report, 24_000), last), &tx).await;
+        let (ok, summary, next) = ask_manager(&crew, &review_prompt(&goal, tail(&report, 24_000), last), dir, &tx).await;
         plan = if last || !ok { vec![] } else { next };
         if plan.is_empty() {
             log(Kind::Good, format!("Done after {round} round{}", if round == 1 { "" } else { "s" }));
@@ -477,14 +618,38 @@ pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: Unbounde
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tokio::sync::mpsc::unbounded_channel;
+
+    fn task(worker: &str, files: &[&str], step: i64) -> Task {
+        Task { worker: worker.into(), role: String::new(), task: "t".into(), files: files.iter().map(|f| f.to_string()).collect(), step }
+    }
+
+    fn crew(manager: String, worker: &str, max_rounds: u32) -> Crew {
+        Crew { max_rounds, manager, worker: worker.into(), max_parallel: 4, worker_timeout_mins: 1, worker_idle_mins: 1 }
+    }
+
+    /// A temp folder per test, removed afterwards.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(name: &str) -> TempDir {
+            let p = std::env::temp_dir().join(format!("foreman-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
 
     #[test]
     fn splits_plan_from_prose() {
-        let reply = "Here's the plan:\n```json\n[{\"worker\": \"coder\", \"role\": \"dev\", \"task\": \"x\"}, {\"worker\": \"\", \"task\": \"y\"}]\n```";
+        let reply = "Here's the plan:\n```json\n[{\"worker\": \"coder\", \"role\": \"dev\", \"task\": \"x\", \"files\": [\"./src/a.rs\", \"b.rs\"]}, {\"worker\": \"\", \"task\": \"y\"}]\n```";
         let (prose, plan) = split_plan(reply);
         assert_eq!(prose, "Here's the plan:");
-        assert_eq!(plan, vec![Task { worker: "coder".into(), role: "dev".into(), task: "x".into(), step: 1 }]);
+        assert_eq!(plan, vec![Task { worker: "coder".into(), role: "dev".into(), task: "x".into(), files: vec!["src/a.rs".into(), "b.rs".into()], step: 1 }]);
         assert_eq!(split_plan("no json here"), ("no json here".into(), vec![]));
         assert!(split_plan("[not json]").1.is_empty());
         assert!(split_plan(r#"{"worker": "coder"}]"#).1.is_empty());
@@ -496,8 +661,51 @@ mod tests {
         let (prose, plan) = split_plan(review);
         assert_eq!(prose, "Done: [x] tests, see [1].\nNext:");
         assert_eq!((plan[0].worker.as_str(), plan[0].task.as_str(), plan[0].step), ("fixer", "fix [edge] case", 2));
+        assert!(plan[0].files.is_empty());
         let (prose, plan) = split_plan("All good, goal met [1].");
         assert!(plan.is_empty() && prose == "All good, goal met [1].");
+    }
+
+    #[test]
+    fn keeps_parallel_workers_off_each_others_files() {
+        let (a, b, c, d) = (task("a", &["x.py"], 1), task("b", &["y.py"], 1), task("c", &["x.py"], 1), task("d", &[], 1));
+        let groups = conflict_free(&[&a, &b, &c, &d]);
+        let names: Vec<Vec<&str>> = groups.iter().map(|g| g.iter().map(|t| t.worker.as_str()).collect()).collect();
+        assert_eq!(names, vec![vec!["a", "b", "d"], vec!["c"]]);
+    }
+
+    #[test]
+    fn tracks_and_attributes_file_changes() {
+        let tmp = TempDir::new("snap");
+        std::fs::write(tmp.0.join("keep.txt"), "same").unwrap();
+        std::fs::write(tmp.0.join("gone.txt"), "x").unwrap();
+        std::fs::create_dir_all(tmp.0.join(".git")).unwrap();
+        let before = snapshot(&tmp.0);
+        std::fs::remove_file(tmp.0.join("gone.txt")).unwrap();
+        std::fs::write(tmp.0.join("new.py"), "print(1)").unwrap();
+        std::fs::write(tmp.0.join(".git/ignored"), "x").unwrap();
+        let files = changed(&before, &snapshot(&tmp.0));
+        assert_eq!(files, ["gone.txt", "new.py"]);
+        let owner = task("builder", &["new.py"], 1);
+        let (summary, unowned) = attribute(&files, &[&owner]);
+        assert_eq!(summary, "gone.txt (no owner) · new.py (builder)");
+        assert_eq!(unowned, ["gone.txt"]);
+    }
+
+    #[test]
+    fn decodes_agent_events() {
+        let claude = r#"{"type":"result","is_error":false,"result":"Hi","total_cost_usd":0.1,"usage":{"input_tokens":2,"cache_creation_input_tokens":10,"cache_read_input_tokens":100,"output_tokens":7}}"#;
+        assert_eq!(parse_event(claude), Event::Result("Hi".into(), false, Usage { input: 112, output: 7, cost: 0.1 }));
+        let step = r#"{"type":"step_finish","part":{"cost":0,"tokens":{"input":17118,"output":38,"reasoning":50,"cache":{"read":5,"write":0}}}}"#;
+        assert_eq!(parse_event(step), Event::Usage(Usage { input: 17123, output: 88, cost: 0.0 }));
+        let text = r#"{"type":"text","part":{"text":"Done.\nAll good."}}"#;
+        assert_eq!(parse_event(text), Event::Lines(vec!["Done.".into(), "All good.".into()]));
+        let tool = r#"{"type":"tool_use","part":{"tool":"write","state":{"status":"completed","input":{"path":"hi.txt"}}}}"#;
+        assert_eq!(parse_event(tool), Event::Lines(vec!["⚙ Write hi.txt".into()]));
+        let failed = r#"{"type":"tool_use","part":{"tool":"bash","state":{"status":"error","input":{"command":"pytest"},"error":"boom"}}}"#;
+        assert_eq!(parse_event(failed), Event::Lines(vec!["⚙ Bash pytest".into(), "Error: boom".into()]));
+        assert_eq!(parse_event(r#"{"type":"step_start"}"#), Event::Lines(vec![]));
+        assert_eq!(parse_event("plain text"), Event::Lines(vec!["plain text".into()]));
     }
 
     #[test]
@@ -511,67 +719,32 @@ mod tests {
     fn finds_model() {
         assert_eq!(model_of(&manager_command("sonnet")), Some("sonnet"));
         assert_eq!(model_of(WORKER_COMMAND), Some("opencode/nemotron-3.5-lightning-free"));
+        assert_eq!(model_of(&worker_command("opencode/x")), Some("opencode/x"));
         assert_eq!(model_of("x --model=opus {prompt}"), Some("opus"));
         assert_eq!(model_of(MANAGER_COMMAND), None);
-        assert!(manager_command("opus").starts_with("claude -p --model opus --output-format stream-json"));
-    }
-
-    #[test]
-    fn parses_claude_stream() {
-        let think = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#;
-        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#;
-        let text = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}}}"#;
-        let tools = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/p/a.txt"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn main"}}]}}"#;
-        assert_eq!(parse_stream(think), vec![Stream::Thinking(50)]);
-        assert_eq!(parse_stream(start), vec![Stream::Thinking(0)]);
-        assert_eq!(parse_stream(text), vec![Stream::Text("Hi".into())]);
-        assert_eq!(parse_stream(tools), vec![Stream::Tool("Read /p/a.txt".into()), Stream::Tool("Grep fn main".into())]);
-        assert!(parse_stream("not json").is_empty() && parse_stream(r#"{"type":"system"}"#).is_empty());
-        let out = format!("{text}\n{}\n", r#"{"type":"result","is_error":false,"result":"Final"}"#);
-        assert_eq!(stream_result(&out), Some((true, "Final".into())));
-        assert_eq!(stream_result("plain"), None);
-    }
-
-    /// A stream-json manager: its tool calls and thinking reach the UI, and the plan
-    /// comes from the final "result" event.
-    #[tokio::test]
-    async fn streams_manager_activity() {
-        let script = r##"case "$1" in
-            *"no prose"*)
-              echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","estimated_tokens":30}}}'
-              echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes.md"}}]}}'
-              echo '{"type":"result","is_error":false,"result":"[{"worker": "coder", "task": "go"}]"}' ;;
-            *) echo '{"type":"result","is_error":false,"result":"All done."}' ;;
-            esac"##;
-        let crew = Crew {
-            max_rounds: 2,
-            // $0 is "stream-json", which marks the command as streaming
-            manager: format!("sh -c {} stream-json {{prompt}}", shlex::try_quote(script).unwrap()),
-            worker: "echo DID {prompt}".into(),
-            max_parallel: 4,
-            worker_timeout_mins: 1,
-            worker_idle_mins: 1,
-        };
-        let (tx, mut rx) = unbounded_channel();
-        orchestrate(crew, "ship it".into(), String::new(), tx).await;
-        let mut msgs = vec![];
-        while let Ok(m) = rx.try_recv() {
-            msgs.push(m);
-        }
-        assert!(msgs.iter().any(|m| matches!(m, Msg::Thinking(30))));
-        assert!(chat(&msgs).contains("→ Read notes.md") && chat(&msgs).contains("All done."));
-        assert!(workers(&msgs).contains(&("coder", State::Done)));
     }
 
     /// A CLI that prints its answer and then hangs is killed once it goes quiet, output kept.
     #[tokio::test]
     async fn kills_quiet_command() {
+        let dir = std::env::temp_dir();
         let start = std::time::Instant::now();
-        let (ok, out) = run_command("sh -c 'echo answer; sleep 5' sh {prompt}", "p", Some(Duration::from_millis(300)), |_| ()).await;
+        let (ok, out, _) = run_command("sh -c 'echo answer; sleep 5' sh {prompt}", "p", &dir, Some(Duration::from_millis(300)), |_| (), |_| ()).await;
         assert!(!ok && out.starts_with("answer\n") && out.contains("no output for"));
         assert!(start.elapsed() < Duration::from_secs(2));
-        let (ok, out) = run_command("echo fine {prompt}", "p", Some(Duration::from_secs(5)), |_| ()).await;
+        let (ok, out, _) = run_command("echo fine {prompt}", "p", &dir, Some(Duration::from_secs(5)), |_| (), |_| ()).await;
         assert!(ok && out == "fine p\n");
+    }
+
+    /// A JSON-speaking agent: its usage is summed and its final result becomes the output.
+    #[tokio::test]
+    async fn counts_tokens() {
+        let script = r#"echo '{"type":"step_finish","part":{"tokens":{"input":10,"output":2}}}'; echo '{"type":"result","is_error":false,"result":"ok","usage":{"input_tokens":5,"output_tokens":1}}'"#;
+        let command = format!("sh -c {} sh {{prompt}}", shlex::try_quote(script).unwrap());
+        let seen = Mutex::new(0);
+        let (ok, out, usage) = run_command(&command, "p", &std::env::temp_dir(), None, |_| (), |u| *seen.lock().unwrap() += u.input).await;
+        assert!(ok && out == "ok");
+        assert_eq!((usage.input, usage.output, *seen.lock().unwrap()), (15, 3, 15));
     }
 
     #[test]
@@ -580,38 +753,66 @@ mod tests {
     }
 
     #[test]
-    fn manager_prompt_carries_history_and_delegates() {
+    fn prompts_carry_history_ownership_and_reports() {
         let p = manager_prompt("fix it", "User: hi\nManager: hello");
-        assert!(p.contains("User: hi") && p.contains("create workers") && p.contains("do not do"));
-        assert!(p.contains("same file"));
+        assert!(p.contains("User: hi") && p.contains("create") && p.contains("do not do") && p.contains("never own the same file"));
         assert!(review_prompt("g", "r", false).contains("check the actual files"));
+        let w = worker_prompt(&task("b", &["calc.py"], 1), "g", "");
+        assert!(w.contains("Files you own: calc.py") && w.contains("report to the manager"));
+        assert!(worker_prompt(&task("t", &[], 2), "g", "").contains("own no files"));
     }
 
-    /// Fake manager: invents coder, then on review a checker for round 2, then says done
-    /// (only if the checker saw round 1's work).
-    async fn run_crew(max_rounds: u32, goal: &str) -> Vec<Msg> {
+    /// Three 0.3s workers with one slot must take about 0.9s; with three slots about 0.3s.
+    #[tokio::test]
+    async fn caps_parallel_workers() {
+        let plan = vec![task("a", &[], 1), task("b", &[], 1), task("c", &[], 1)];
+        for (slots, min_ms, max_ms) in [(1, 850, 2_000), (3, 250, 800)] {
+            let mut crew = crew(String::new(), "sh -c 'sleep 0.3' sh {prompt}", 1);
+            crew.max_parallel = slots;
+            let (tx, _rx) = unbounded_channel();
+            let start = std::time::Instant::now();
+            run_plan(&crew, "g", &plan, &std::env::temp_dir(), &mut String::new(), &tx).await;
+            let ms = start.elapsed().as_millis();
+            assert!((min_ms..max_ms).contains(&ms), "{slots} slot(s) took {ms}ms");
+        }
+    }
+
+    /// Aborting a job (Ctrl+S) must kill its workers before they finish.
+    #[tokio::test]
+    async fn abort_kills_workers() {
+        let tmp = TempDir::new("abort");
+        let crew = crew(String::new(), "sh -c 'sleep 0.6; touch marker' sh {prompt}", 1);
+        let plan = vec![task("w", &[], 1)];
+        let (tx, _rx) = unbounded_channel();
+        let dir = tmp.0.clone();
+        let job = tokio::spawn(async move { run_plan(&crew, "g", &plan, &dir, &mut String::new(), &tx).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        job.abort();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!tmp.0.join("marker").exists(), "worker kept running after abort");
+    }
+
+    /// Fake manager: invents coder (owning out.txt), then on review a checker for round 2, then
+    /// says done (only if the checker saw round 1's report and foreman's file record).
+    async fn run_crew(max_rounds: u32, goal: &str) -> (Vec<Msg>, TempDir) {
         let script = r##"case "$1" in
             *"hello"*) echo 'Hi there!' ;;
-            *"no prose"*) echo 'On it.'; echo '[{"worker": "coder", "role": "dev", "task": "write it"}]' ;;
-            *"# Round 2"*"check it"*"write it"*) echo 'ALL DONE' ;;
+            *"no prose"*) echo 'On it.'; echo '[{"worker": "coder", "role": "dev", "task": "write it", "files": ["out.txt"]}]' ;;
+            *"# Round 2"*"check it"*"write it"*"out.txt (coder)"*) echo 'ALL DONE' ;;
             *"# Round 2"*) echo 'NO HISTORY' ;;
             *) echo 'Needs a check.'; echo '[{"worker": "checker", "role": "qa", "task": "check it"}]' ;;
             esac"##;
-        let crew = Crew {
-            max_rounds,
-            manager: format!("sh -c {} sh {{prompt}}", shlex::try_quote(script).unwrap()),
-            worker: "echo DID {prompt}".into(),
-            max_parallel: 4,
-            worker_timeout_mins: 1,
-            worker_idle_mins: 1,
-        };
+        let manager = format!("sh -c {} sh {{prompt}}", shlex::try_quote(script).unwrap());
+        // workers echo their prompt and write out.txt, so file tracking has something to see
+        let crew = crew(manager, "sh -c 'echo DID \"$1\" | tee out.txt' sh {prompt}", max_rounds);
+        let tmp = TempDir::new(&format!("crew-{max_rounds}-{}", goal.len()));
         let (tx, mut rx) = unbounded_channel();
-        orchestrate(crew, goal.into(), "User: earlier\nManager: ok".into(), tx).await;
+        orchestrate_in(crew, goal.into(), "User: earlier\nManager: ok".into(), &tmp.0, tx).await;
         let mut msgs = vec![];
         while let Ok(m) = rx.try_recv() {
             msgs.push(m);
         }
-        msgs
+        (msgs, tmp)
     }
 
     fn chat(msgs: &[Msg]) -> String {
@@ -635,9 +836,11 @@ mod tests {
 
     #[tokio::test]
     async fn replans_until_done() {
-        let msgs = run_crew(3, "ship it").await;
+        let (msgs, _tmp) = run_crew(3, "ship it").await;
         let chat = chat(&msgs);
         assert!(chat.contains("On it.") && !chat.contains("\"worker\""), "prose shown, JSON hidden");
+        assert!(chat.contains("files changed: out.txt (coder)"), "{chat}");
+        assert!(chat.contains("files changed: out.txt (no owner)"), "the checker owned nothing but wrote anyway: {chat}");
         assert!(chat.contains("ALL DONE"), "round 2 saw round 1: {chat}");
         assert!(chat.contains("Done after 2 rounds"));
         let w = workers(&msgs);
@@ -647,61 +850,16 @@ mod tests {
         assert!(msgs.iter().any(|m| matches!(m, Msg::Remember(r) if r.contains("ALL DONE"))));
     }
 
-    /// Three 0.3s workers with one slot must take about 0.9s; with three slots about 0.3s.
-    #[tokio::test]
-    async fn caps_parallel_workers() {
-        let plan: Vec<Task> = ["a", "b", "c"]
-            .iter()
-            .map(|n| Task { worker: n.to_string(), role: String::new(), task: "t".into(), step: 1 })
-            .collect();
-        for (slots, min_ms, max_ms) in [(1, 850, 2_000), (3, 250, 800)] {
-            let crew = Crew {
-                max_rounds: 1,
-                manager: String::new(),
-                worker: "sh -c 'sleep 0.3' sh {prompt}".into(),
-                max_parallel: slots,
-                worker_timeout_mins: 1,
-                worker_idle_mins: 1,
-            };
-            let (tx, _rx) = unbounded_channel();
-            let start = std::time::Instant::now();
-            run_plan(&crew, "g", &plan, &mut String::new(), &tx).await;
-            let ms = start.elapsed().as_millis();
-            assert!((min_ms..max_ms).contains(&ms), "{slots} slot(s) took {ms}ms");
-        }
-    }
-
-    /// Aborting a job (Ctrl+S) must kill its workers before they finish.
-    #[tokio::test]
-    async fn abort_kills_workers() {
-        let marker = std::env::temp_dir().join(format!("foreman-abort-{}", std::process::id()));
-        let crew = Crew {
-            max_rounds: 1,
-            manager: String::new(),
-            worker: format!("sh -c 'sleep 0.6; touch {}' sh {{prompt}}", marker.display()),
-            max_parallel: 4,
-            worker_timeout_mins: 1,
-            worker_idle_mins: 1,
-        };
-        let plan = vec![Task { worker: "w".into(), role: String::new(), task: "t".into(), step: 1 }];
-        let (tx, _rx) = unbounded_channel();
-        let job = tokio::spawn(async move { run_plan(&crew, "g", &plan, &mut String::new(), &tx).await });
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        job.abort();
-        tokio::time::sleep(Duration::from_millis(900)).await;
-        assert!(!marker.exists(), "worker kept running after abort");
-    }
-
     #[tokio::test]
     async fn stops_at_round_cap() {
-        let msgs = run_crew(1, "ship it").await;
+        let (msgs, _tmp) = run_crew(1, "ship it").await;
         assert!(!workers(&msgs).iter().any(|(n, _)| *n == "checker"));
         assert!(chat(&msgs).contains("Done after 1 round"));
     }
 
     #[tokio::test]
     async fn answers_chat_without_workers() {
-        let msgs = run_crew(3, "hello").await;
+        let (msgs, _tmp) = run_crew(3, "hello").await;
         assert!(chat(&msgs).contains("Hi there!"));
         assert!(workers(&msgs).is_empty());
         assert!(msgs.iter().any(|m| matches!(m, Msg::Remember(r) if r.contains("Hi there!"))));

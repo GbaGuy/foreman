@@ -1,23 +1,23 @@
 //! foreman: a terminal boss for a crew of AI agents.
 //!
 //! You only talk to the manager (Claude). It doesn't do the work itself: it
-//! creates workers as needed, gives each a role and a task, runs them (in
-//! parallel or in steps), and reviews and re-plans until the goal is met.
+//! creates workers as needed, sends each one its orders, and reviews their
+//! replies, re-planning until the goal is met.
 //!
-//! The UI follows Claude Code's look: a flowing transcript (`>` for you, `⏺`
-//! for the manager, `⎿` for results), each round as a to-do list, an orange
-//! `✻` spinner, and a plain prompt box. Tabs switch between the manager, an
-//! overview of all workers, and one tab per worker.
+//! The UI is a team chat in Claude Code's style: `you → manager`,
+//! `manager → builder` (the orders), `builder → manager` (the reply). Tabs
+//! switch between that chat, an overview of all workers, and one tab per
+//! worker with its own conversation and work log.
 
 mod crew;
 
-use crew::{Crew, Kind, Msg, State, Task};
+use crew::{Crew, Kind, Msg, State, Task, Usage};
 use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -25,7 +25,7 @@ use tokio::task::JoinHandle;
 
 struct Theme {
     name: &'static str,
-    accent: Color, // brand: spinner, welcome box, selection
+    accent: Color, // brand and the manager's name
     text: Color,
     dim: Color,
     faint: Color, // borders and rules
@@ -33,6 +33,7 @@ struct Theme {
     warn: Color,
     bad: Color,
     info: Color,
+    violet: Color,
 }
 
 const fn rgb(hex: u32) -> Color {
@@ -42,11 +43,11 @@ const fn rgb(hex: u32) -> Color {
 #[rustfmt::skip]
 const THEMES: [Theme; 3] = [
     Theme { name: "claude", accent: rgb(0xd77757), text: rgb(0xe6e6e6), dim: rgb(0x999999), faint: rgb(0x505050),
-            good: rgb(0x4eba65), warn: rgb(0xffc107), bad: rgb(0xff6b80), info: rgb(0xb1b9f9) },
+            good: rgb(0x4eba65), warn: rgb(0xffc107), bad: rgb(0xff6b80), info: rgb(0xb1b9f9), violet: rgb(0xd0a8ff) },
     Theme { name: "tokyo-night", accent: rgb(0xff9e64), text: rgb(0xc0caf5), dim: rgb(0x737aa2), faint: rgb(0x3b4261),
-            good: rgb(0x9ece6a), warn: rgb(0xe0af68), bad: rgb(0xf7768e), info: rgb(0x7dcfff) },
+            good: rgb(0x9ece6a), warn: rgb(0xe0af68), bad: rgb(0xf7768e), info: rgb(0x7dcfff), violet: rgb(0xbb9af7) },
     Theme { name: "catppuccin", accent: rgb(0xfab387), text: rgb(0xcdd6f4), dim: rgb(0x7f849c), faint: rgb(0x45475a),
-            good: rgb(0xa6e3a1), warn: rgb(0xf9e2af), bad: rgb(0xf38ba8), info: rgb(0x89dceb) },
+            good: rgb(0xa6e3a1), warn: rgb(0xf9e2af), bad: rgb(0xf38ba8), info: rgb(0x89dceb), violet: rgb(0xcba6f7) },
 ];
 
 /// Claude Code's spinner glyphs.
@@ -63,23 +64,25 @@ struct Picker {
     sel: usize,
 }
 
-/// One entry in the manager transcript.
+/// One message or note in the team chat.
 enum Entry {
     Line(Kind, String),
-    /// A task in a round's to-do list, with its worker's latest state (None = queued).
+    /// The manager's orders to a worker, with that worker's latest state (None = queued).
     Task(Task, Option<State>),
+    /// A worker's reply to the manager: the end of its output.
+    Reply { worker: String, text: String },
 }
 
 /// One worker of the current job, as the UI tracks it.
 struct Worker {
     name: String,
     role: String,
-    task: String,
     step: i64,
     state: Option<State>, // None while queued behind an earlier step
     started: Instant,
     took: Option<Duration>,
     output: Vec<String>,
+    usage: Usage,
     scroll_back: u16,
 }
 
@@ -95,9 +98,8 @@ struct App {
     workers: Vec<Worker>,
     tab: usize, // MANAGER_TAB, OVERVIEW_TAB, or 2 + worker index
     manager: Option<State>,
-    thinking: Option<u64>, // rough tokens the manager has spent thinking on its current call
-    live: String,          // the manager's reply as it streams in
-    scroll_back: u16,      // lines the transcript is scrolled up from the bottom
+    manager_usage: Usage, // the manager's tokens this session
+    scroll_back: u16,     // lines the chat is scrolled up from the bottom
     input: String,
     cursor: usize, // in chars
     busy: bool,
@@ -127,6 +129,10 @@ impl App {
         SPINNER[(self.started.elapsed().as_millis() / 120) as usize % SPINNER.len()]
     }
 
+    fn worker(&self, name: &str) -> Option<&Worker> {
+        self.workers.iter().find(|w| w.name == name)
+    }
+
     fn worker_mut(&mut self, name: &str) -> Option<&mut Worker> {
         self.workers.iter_mut().find(|w| w.name == name)
     }
@@ -134,42 +140,42 @@ impl App {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Log(kind, text) => self.chat.push(Entry::Line(kind, text)),
-            Msg::Manager(state) => (self.manager, self.thinking, self.live) = (Some(state), None, String::new()),
-            Msg::Thinking(n) => self.thinking = Some(self.thinking.unwrap_or(0) + n),
-            Msg::ManagerText(text) => self.live.push_str(&text),
+            Msg::Manager(state) => self.manager = Some(state),
             Msg::Assign(task) => {
                 self.chat.push(Entry::Task(task.clone(), None));
                 match self.worker_mut(&task.worker) {
-                    // the manager reused a name in a later round: same tab, new task
+                    // the manager reused a name in a later round: same tab, new orders
                     Some(w) => {
                         w.output.push(format!("── new task as {} ──", task.role));
-                        (w.role, w.task, w.step, w.state, w.took) = (task.role, task.task, task.step, None, None);
+                        (w.role, w.step, w.state, w.took) = (task.role, task.step, None, None);
                     }
                     None => self.workers.push(Worker {
                         name: task.worker,
                         role: task.role,
-                        task: task.task,
                         step: task.step,
                         state: None,
                         started: Instant::now(),
                         took: None,
                         output: Vec::new(),
+                        usage: Usage::default(),
                         scroll_back: 0,
                     }),
                 }
             }
             Msg::Worker(name, state) => {
-                // tick the worker's latest to-do item
+                // update the worker's latest orders in the chat
                 if let Some(Entry::Task(_, s)) = self.chat.iter_mut().rev().find(|e| matches!(e, Entry::Task(t, _) if t.worker == name)) {
                     *s = Some(state);
                 }
-                if let Some(w) = self.worker_mut(&name) {
-                    if state == State::Working {
-                        (w.started, w.took) = (Instant::now(), None);
-                    } else {
-                        w.took = Some(w.started.elapsed());
-                    }
-                    w.state = Some(state);
+                let Some(w) = self.worker_mut(&name) else { return };
+                if state == State::Working {
+                    (w.started, w.took, w.state) = (Instant::now(), None, Some(state));
+                    return;
+                }
+                (w.took, w.state) = (Some(w.started.elapsed()), Some(state));
+                let text = w.output[reply_start(&w.output)..].join("\n").trim().to_string();
+                if !text.is_empty() {
+                    self.chat.push(Entry::Reply { worker: name, text });
                 }
             }
             Msg::Output(name, line) => {
@@ -178,6 +184,12 @@ impl App {
                     if w.output.len() > MAX_OUTPUT_LINES {
                         w.output.drain(..1_000);
                     }
+                }
+            }
+            Msg::Usage(name, u) if name == "manager" => self.manager_usage += u,
+            Msg::Usage(name, u) => {
+                if let Some(w) = self.worker_mut(&name) {
+                    w.usage += u;
                 }
             }
             Msg::Notify(text) => self.toast(text),
@@ -288,7 +300,7 @@ impl App {
                 *s = Some(State::Failed);
             }
         }
-        self.chat.push(Entry::Line(Kind::Warn, "Interrupted by user. Running workers were killed.".into()));
+        self.chat.push(Entry::Line(Kind::Warn, "Interrupted by you. Running workers were stopped.".into()));
     }
 
     fn open_picker(&mut self, for_manager: bool) {
@@ -352,7 +364,8 @@ impl App {
         self.draw_tabs(f, tabs);
         let body = body.inner(Margin::new(1, 0));
         match self.tab {
-            MANAGER_TAB => self.draw_transcript(f, body),
+            MANAGER_TAB if self.chat.is_empty() && !self.busy => self.draw_welcome(f, body),
+            MANAGER_TAB => render_scrolled(f, self.team_chat(body.width), body, self.scroll_back),
             OVERVIEW_TAB => self.draw_overview(f, body),
             i => self.draw_worker_tab(f, body, i - 2),
         }
@@ -361,6 +374,161 @@ impl App {
         self.draw_footer(f, footer.inner(Margin::new(2, 0)));
         if let Some(p) = &self.picker {
             self.draw_picker(f, p);
+        }
+    }
+
+    /// A worker's name colour: stable per name, so it reads the same in every message and tab.
+    fn color_of(&self, name: &str) -> Color {
+        let t = self.t();
+        let palette = [t.info, t.good, t.violet, t.warn];
+        palette[name.bytes().map(usize::from).sum::<usize>() % palette.len()]
+    }
+
+    fn name(&self, who: &str) -> Span<'static> {
+        let t = self.t();
+        let color = match who {
+            "you" => t.text,
+            "manager" => t.accent,
+            worker => self.color_of(worker),
+        };
+        Span::styled(who.to_string(), Style::new().fg(color).bold())
+    }
+
+    /// `from → to   extra…`: the first line of every chat message.
+    fn header(&self, from: &str, to: &str, extra: Vec<Span<'static>>) -> Line<'static> {
+        let t = self.t();
+        let mut spans = vec![self.name(from), Span::styled(" → ", Style::new().fg(t.dim)), self.name(to)];
+        spans.extend(extra);
+        Line::from(spans)
+    }
+
+    /// Where a worker stands, as shown next to its orders: `○ queued`, `◼ working 12s`, `✓ done in 33s`.
+    fn task_status(&self, task: &Task, state: Option<State>) -> Vec<Span<'static>> {
+        let t = self.t();
+        let worker = self.worker(&task.worker);
+        let time = worker.and_then(Worker::elapsed).map(fmt_duration).unwrap_or_default();
+        let tokens = worker.map(|w| tokens(w.usage)).filter(|t| !t.is_empty()).map(|t| format!(" · {t}")).unwrap_or_default();
+        let (text, color) = match state {
+            None => (format!("○ queued for step {}", task.step), t.dim),
+            Some(State::Working) => (format!("◼ working {time}{tokens}"), t.warn),
+            Some(State::Done) => (format!("✓ done in {time}{tokens}"), t.good),
+            Some(State::Failed) => (format!("✗ failed{tokens}"), t.bad),
+        };
+        vec![Span::styled(format!(" · {}   ", task.role), Style::new().fg(t.dim)), Span::styled(text, Style::new().fg(color))]
+    }
+
+    /// The files a worker was given, under its orders: `owns calc.py, util.py`.
+    fn owns(&self, task: &Task) -> Line<'static> {
+        let t = self.t();
+        let files = if task.files.is_empty() { "no files (read and run only)".to_string() } else { task.files.join(", ") };
+        Line::from(vec![Span::styled("  owns ", Style::new().fg(t.dim)), Span::styled(files, Style::new().fg(t.info))])
+    }
+
+    /// Message text, wrapped to `width` and indented under its header; Markdown when `md`.
+    fn body(&self, text: &str, width: u16, md: bool) -> Vec<Line<'static>> {
+        let t = self.t();
+        let mut in_code = false;
+        wrap(text, (width as usize).saturating_sub(2))
+            .into_iter()
+            .filter_map(|l| if md { markdown(&l, &mut in_code, t) } else { Some(Line::styled(l, Style::new().fg(t.text))) })
+            .map(|mut line| {
+                line.spans.insert(0, Span::raw("  "));
+                line
+            })
+            .collect()
+    }
+
+    /// The team chat on the manager tab.
+    fn team_chat(&self, width: u16) -> Vec<Line<'static>> {
+        let t = self.t();
+        let mut lines: Vec<Line<'static>> = vec![];
+        let mut manager_speaking = false;
+        for entry in &self.chat {
+            let was_speaking = std::mem::replace(&mut manager_speaking, matches!(entry, Entry::Line(Kind::Out, _)));
+            match entry {
+                Entry::Line(Kind::User, text) => {
+                    lines.extend([Line::default(), self.header("you", "manager", vec![])]);
+                    lines.extend(self.body(text, width, false));
+                }
+                Entry::Line(Kind::Out, text) => {
+                    if !was_speaking {
+                        lines.extend([Line::default(), self.header("manager", "you", vec![])]);
+                    }
+                    lines.extend(self.body(text, width, true));
+                }
+                Entry::Line(Kind::Rule, text) => {
+                    let fill = (width as usize).saturating_sub(text.chars().count() + 4);
+                    lines.extend([Line::default(), Line::styled(format!("── {text} {}", "─".repeat(fill)), Style::new().fg(t.faint))]);
+                }
+                Entry::Task(task, state) => {
+                    lines.extend([Line::default(), self.header("manager", &task.worker, self.task_status(task, *state))]);
+                    lines.extend(self.body(&task.task, width, false));
+                    lines.push(self.owns(task));
+                }
+                Entry::Reply { worker, text } => {
+                    lines.extend([Line::default(), self.header(worker, "manager", vec![])]);
+                    lines.extend(self.body(text, width, true));
+                }
+                Entry::Line(kind, text) => {
+                    let color = match kind {
+                        Kind::Good => t.dim,
+                        Kind::Warn => t.warn,
+                        _ => t.bad,
+                    };
+                    lines.push(Line::from(vec![Span::styled("  ⎿  ", Style::new().fg(t.dim)), Span::styled(text.clone(), Style::new().fg(color))]));
+                }
+            }
+        }
+        lines
+    }
+
+    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
+        let t = self.t();
+        let width = area.width.min(64);
+        let [boxed, _, tips] = Layout::vertical([Constraint::Length(7), Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t.accent)).padding(Padding::horizontal(1));
+        let welcome = vec![
+            Line::from(vec![Span::styled("✻ ", Style::new().fg(t.accent)), Span::styled("Welcome to foreman!", Style::new().fg(t.text).bold())]),
+            Line::default(),
+            Line::styled("  Talk to the manager. It creates AI workers, sends each", Style::new().fg(t.dim).italic()),
+            Line::styled("  one its orders, checks their replies, and reports back.", Style::new().fg(t.dim).italic()),
+            Line::styled(format!("  cwd: {}", shorten(&self.cwd, width as usize - 12)), Style::new().fg(t.dim)),
+        ];
+        f.render_widget(Paragraph::new(welcome).block(block), Rect { width, ..boxed });
+        let tip = |n: &str, text: &str| Line::from(vec![Span::styled(format!(" {n}. "), Style::new().fg(t.dim)), Span::styled(text.to_string(), Style::new().fg(t.dim))]);
+        let lines = vec![
+            Line::styled(" Tips for getting started:", Style::new().fg(t.dim)),
+            Line::default(),
+            tip("1", "Describe a goal; you'll see the manager give each worker its orders here"),
+            tip("2", "Workers reply to the manager when they finish; it checks their work"),
+            tip("3", "Press tab to see all workers live, or one worker's conversation and work log"),
+        ];
+        f.render_widget(Paragraph::new(lines), tips);
+    }
+
+    /// `✻ foreman`, then the tabs (selected one in the accent colour), and the folder on the right.
+    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
+        let t = self.t();
+        let mut spans = vec![Span::styled(" ✻ foreman", Style::new().fg(t.accent).bold()), Span::raw("   ")];
+        let mut titles: Vec<(Option<Span>, String, Color)> = vec![(None, "Team chat".into(), t.dim), (None, format!("Workers {}", self.workers.len()), t.dim)];
+        titles.extend(self.workers.iter().map(|w| (Some(self.dot(w.state)), w.name.clone(), self.color_of(&w.name))));
+        for (i, (dot, name, color)) in titles.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(if i == 2 { "  │  " } else { "  ·  " }, Style::new().fg(t.faint)));
+            }
+            if let Some(dot) = dot {
+                spans.extend([dot, Span::raw(" ")]);
+            }
+            let style = if i == self.tab { Style::new().fg(if i < 2 { t.accent } else { color }).bold().underlined() } else { Style::new().fg(t.dim) };
+            spans.push(Span::styled(name, style));
+        }
+        // ponytail: many workers can overflow a narrow terminal; Tab still reaches them, the bar just clips
+        let tabs = Line::from(spans);
+        // the folder goes on the right only if it fits beside the tabs
+        let room = (area.width as usize).saturating_sub(tabs.width() + 4);
+        f.render_widget(tabs, area);
+        if room > 12 {
+            f.render_widget(Line::styled(format!("{} ", shorten(&self.cwd, room)), Style::new().fg(t.dim)).right_aligned(), area);
         }
     }
 
@@ -378,55 +546,25 @@ impl App {
         }
     }
 
-    /// `✻ foreman`, then the tabs (selected one in the accent colour), and the folder on the right.
-    fn draw_tabs(&self, f: &mut Frame, area: Rect) {
-        let t = self.t();
-        let mut spans = vec![Span::styled(" ✻ foreman", Style::new().fg(t.accent).bold()), Span::styled("   ", Style::new())];
-        let mut titles: Vec<(Option<Span>, String)> = vec![(None, "Manager".into()), (None, format!("Workers {}", self.workers.len()))];
-        titles.extend(self.workers.iter().map(|w| (Some(self.dot(w.state)), w.name.clone())));
-        for (i, (dot, name)) in titles.into_iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(if i == 2 { "  │  " } else { "  ·  " }, Style::new().fg(t.faint)));
-            }
-            if let Some(dot) = dot {
-                spans.extend([dot, Span::raw(" ")]);
-            }
-            let style = if i == self.tab { Style::new().fg(t.accent).bold().underlined() } else { Style::new().fg(t.dim) };
-            spans.push(Span::styled(name, style));
-        }
-        // ponytail: many workers can overflow a narrow terminal; Tab still reaches them, the bar just clips
-        let tabs = Line::from(spans);
-        // the folder goes on the right only if it fits beside the tabs
-        let room = (area.width as usize).saturating_sub(tabs.width() + 4);
-        f.render_widget(tabs, area);
-        if room > 12 {
-            f.render_widget(Line::styled(format!("{} ", shorten(&self.cwd, room)), Style::new().fg(t.dim)).right_aligned(), area);
-        }
-    }
-
-    /// Claude Code's spinner line: `✻ Planning… (12s · ~50 tokens · ctrl+s to stop)`.
+    /// Claude Code's spinner line, saying who is busy: `✻ builder, tester working… (12s · ctrl+s to stop)`.
     fn draw_status(&self, f: &mut Frame, area: Rect) {
         let t = self.t();
         if !self.busy {
             return;
         }
-        let running = self.workers.iter().filter(|w| w.state == Some(State::Working)).count();
-        let verb = match (self.manager == Some(State::Working), self.workers.is_empty(), running) {
-            (true, true, _) => "Planning…".to_string(),
-            (true, false, _) => "Reviewing…".to_string(),
-            (false, _, n) if n > 0 => format!("{n} worker{} working…", if n == 1 { "" } else { "s" }),
-            _ => "Working…".to_string(),
+        let running: Vec<&str> = self.workers.iter().filter(|w| w.state == Some(State::Working)).map(|w| w.name.as_str()).collect();
+        let what = match (self.manager == Some(State::Working), self.workers.is_empty(), running.len()) {
+            (true, true, _) => "manager is planning…".to_string(),
+            (true, false, _) => "manager is reviewing the replies…".to_string(),
+            (false, _, 1..=3) => format!("{} working…", running.join(", ")),
+            (false, _, n) if n > 3 => format!("{n} workers working…"),
+            _ => "working…".to_string(),
         };
-        let mut details = vec![fmt_duration(self.job_started.elapsed())];
-        if let (Some(n), Some(State::Working)) = (self.thinking, self.manager) {
-            details.push(format!("~{n} tokens"));
-        }
-        details.push("ctrl+s to stop".into());
         f.render_widget(
             Line::from(vec![
                 Span::styled(format!("{} ", self.spinner()), Style::new().fg(t.accent)),
-                Span::styled(verb, Style::new().fg(t.accent)),
-                Span::styled(format!(" ({})", details.join(" · ")), Style::new().fg(t.dim)),
+                Span::styled(what, Style::new().fg(t.accent)),
+                Span::styled(format!(" ({} · ctrl+s to stop)", fmt_duration(self.job_started.elapsed())), Style::new().fg(t.dim)),
             ]),
             area,
         );
@@ -440,7 +578,7 @@ impl App {
         f.render_widget(block, area);
         f.render_widget(Span::styled(">", Style::new().fg(t.text)), prompt);
         if self.input.is_empty() {
-            let hint = if self.busy { "Wait for the manager, or ctrl+s to stop" } else { "Try \"build a todo app in todo.py, with tests\"" };
+            let hint = if self.busy { "Wait for the manager, or ctrl+s to stop" } else { "Message the manager, e.g. \"build a todo app in todo.py, with tests\"" };
             f.render_widget(Span::styled(hint, Style::new().fg(t.dim)), text);
         } else {
             // scroll horizontally so the cursor stays in view
@@ -470,146 +608,48 @@ impl App {
                 let manager = crew::model_of(&self.crew.manager).unwrap_or("default");
                 let worker = crew::model_of(&self.crew.worker).unwrap_or("default");
                 let worker = worker.rsplit('/').next().unwrap_or(worker);
-                Span::styled(format!("claude {manager} · workers {worker}"), Style::new().fg(t.dim))
+                let mut workers = Usage::default();
+                for w in &self.workers {
+                    workers += w.usage;
+                }
+                let used = |u: Usage| if u == Usage::default() { String::new() } else { format!(" {}", tokens(u)) };
+                // once tokens are counted, they replace the (long) worker model name
+                let workers = if workers == Usage::default() { format!("workers {worker}") } else { format!("workers{}", used(workers)) };
+                Span::styled(format!("claude {manager}{} · {workers}", used(self.manager_usage)), Style::new().fg(t.dim))
             }
         };
         // the right side keeps its width; the hints get the rest
-        let [left, gap, right_area] = Layout::horizontal([Constraint::Min(0), Constraint::Length(2), Constraint::Length(right.width() as u16)]).areas(area);
-        let _ = gap;
+        let [left, _, right_area] = Layout::horizontal([Constraint::Min(0), Constraint::Length(2), Constraint::Length(right.width() as u16)]).areas(area);
         f.render_widget(Line::styled(hints.join(" · "), Style::new().fg(t.dim)), left);
         f.render_widget(Line::from(right), right_area);
-    }
-
-    // ---- manager tab ----------------------------------------------------------
-    fn draw_transcript(&self, f: &mut Frame, area: Rect) {
-        if self.chat.is_empty() && !self.busy {
-            return self.draw_welcome(f, area);
-        }
-        render_scrolled(f, self.transcript(), area, self.scroll_back);
-    }
-
-    fn draw_welcome(&self, f: &mut Frame, area: Rect) {
-        let t = self.t();
-        let width = area.width.min(64);
-        let [boxed, _, tips] = Layout::vertical([Constraint::Length(7), Constraint::Length(1), Constraint::Min(0)]).areas(area);
-        let boxed = Rect { width, ..boxed };
-        let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t.accent));
-        let welcome = vec![
-            Line::from(vec![Span::styled("✻ ", Style::new().fg(t.accent)), Span::styled("Welcome to foreman!", Style::new().fg(t.text).bold())]),
-            Line::default(),
-            Line::styled("  Talk to the manager. It creates AI workers, gives each", Style::new().fg(t.dim).italic()),
-            Line::styled("  a role and a task, checks their work, and reports back.", Style::new().fg(t.dim).italic()),
-            Line::styled(format!("  cwd: {}", shorten(&self.cwd, width as usize - 12)), Style::new().fg(t.dim)),
-        ];
-        f.render_widget(Paragraph::new(welcome).block(block.padding(ratatui::widgets::Padding::horizontal(1))), boxed);
-        let tip = |n: &str, text: &str| Line::from(vec![Span::styled(format!(" {n}. "), Style::new().fg(t.dim)), Span::styled(text.to_string(), Style::new().fg(t.dim))]);
-        let lines = vec![
-            Line::styled(" Tips for getting started:", Style::new().fg(t.dim)),
-            Line::default(),
-            tip("1", "Describe a goal; the manager splits it into tasks for its workers"),
-            tip("2", "Press tab to watch all the workers, or any single one, live"),
-            tip("3", "Ask a plain question and the manager just answers it"),
-        ];
-        f.render_widget(Paragraph::new(lines), tips);
-    }
-
-    /// The manager transcript in Claude Code's style.
-    fn transcript(&self) -> Vec<Line<'static>> {
-        let t = self.t();
-        let (mut lines, mut in_code, mut in_reply, mut in_list) = (vec![], false, false, false);
-        let gap = |lines: &mut Vec<Line<'static>>| {
-            if lines.last().is_some_and(|l: &Line| !l.spans.is_empty()) {
-                lines.push(Line::default());
-            }
-        };
-        for entry in &self.chat {
-            let is_reply = matches!(entry, Entry::Line(Kind::Out, _));
-            let is_task = matches!(entry, Entry::Task(..));
-            match entry {
-                Entry::Line(Kind::User, text) => {
-                    gap(&mut lines);
-                    lines.push(Line::from(vec![Span::styled("> ", Style::new().fg(t.dim)), Span::styled(text.clone(), Style::new().fg(t.dim))]));
-                }
-                Entry::Line(Kind::Out, text) => {
-                    if !in_reply {
-                        gap(&mut lines);
-                    }
-                    if let Some(mut line) = markdown(text, &mut in_code, t) {
-                        let lead = if in_reply { Span::raw("  ") } else { Span::styled("⏺ ", Style::new().fg(t.text)) };
-                        line.spans.insert(0, lead);
-                        lines.push(line);
-                    }
-                }
-                Entry::Line(Kind::Think, text) => {
-                    gap(&mut lines);
-                    lines.push(tool_line(text.trim_start_matches("→ "), t.good, t));
-                }
-                Entry::Line(Kind::Rule, text) => {
-                    gap(&mut lines);
-                    lines.push(Line::from(vec![Span::styled("⏺ ", Style::new().fg(t.text)), Span::styled(text.clone(), Style::new().fg(t.text).bold())]));
-                }
-                Entry::Task(task, state) => {
-                    let (mark, name_style) = match state {
-                        None => ("☐", Style::new().fg(t.text)),
-                        Some(State::Working) => ("◼", Style::new().fg(t.warn).bold()),
-                        Some(State::Done) => ("☒", Style::new().fg(t.dim).add_modifier(Modifier::CROSSED_OUT)),
-                        Some(State::Failed) => ("✗", Style::new().fg(t.bad)),
-                    };
-                    let lead = if in_list { "     " } else { "  ⎿  " };
-                    lines.push(Line::from(vec![
-                        Span::styled(lead, Style::new().fg(t.dim)),
-                        Span::styled(format!("{mark} "), name_style.remove_modifier(Modifier::CROSSED_OUT)),
-                        Span::styled(task.worker.clone(), name_style),
-                        Span::styled(format!(" · {}", task.role), Style::new().fg(t.dim)),
-                    ]));
-                    lines.push(Line::styled(format!("       {}", task.task), Style::new().fg(t.dim)));
-                }
-                Entry::Line(kind, text) => {
-                    let color = match kind {
-                        Kind::Good => t.dim,
-                        Kind::Warn => t.warn,
-                        _ => t.bad,
-                    };
-                    lines.push(Line::from(vec![Span::styled("  ⎿  ", Style::new().fg(t.dim)), Span::styled(text.clone(), Style::new().fg(color))]));
-                }
-            }
-            in_reply = is_reply;
-            in_list = is_task;
-        }
-        if self.busy && self.manager == Some(State::Working) && !self.live.is_empty() {
-            gap(&mut lines);
-            for (i, l) in self.live.lines().enumerate() {
-                let lead = if i == 0 { Span::styled("⏺ ", Style::new().fg(t.dim)) } else { Span::raw("  ") };
-                lines.push(Line::from(vec![lead, Span::styled(l.to_string(), Style::new().fg(t.dim))]));
-            }
-        }
-        lines
     }
 
     // ---- workers --------------------------------------------------------------
     fn worker_title(&self, w: &Worker) -> Line<'static> {
         let t = self.t();
+        let mut time = w.elapsed().map_or(format!("queued for step {}", w.step), fmt_duration);
+        let used = tokens(w.usage);
+        if !used.is_empty() {
+            time = format!("{time} · {used}");
+        }
         Line::from(vec![
             self.dot(w.state),
-            Span::styled(format!(" {}", w.name), Style::new().fg(t.text).bold()),
-            Span::styled(format!(" · {}", w.role), Style::new().fg(t.dim)),
+            Span::styled(format!(" {}", w.name), Style::new().fg(self.color_of(&w.name)).bold()),
+            Span::styled(format!(" · {} · {time} ", w.role), Style::new().fg(t.dim)),
         ])
     }
 
-    fn worker_time(&self, w: &Worker) -> String {
-        w.elapsed().map_or(format!("waits for step {}", w.step), fmt_duration)
-    }
-
-    /// A worker's output in Claude Code's style; `last` caps how much is laid out.
-    fn output_lines(&self, w: &Worker, last: usize) -> Vec<Line<'static>> {
+    /// A worker's work log: its actions and output, behind a `│` gutter.
+    fn work_log(&self, lines: &[String]) -> Vec<Line<'static>> {
         let t = self.t();
-        let tail = &w.output[w.output.len().saturating_sub(last)..];
-        let lines: Vec<Line> = tail.iter().filter_map(|l| worker_line(l, t)).collect();
-        if lines.is_empty() {
-            let note = if w.state.is_none() { "Queued: starts when the earlier steps finish" } else { "Starting…" };
-            return vec![Line::styled(format!("  ⎿  {note}"), Style::new().fg(t.dim))];
-        }
         lines
+            .iter()
+            .filter_map(|l| worker_line(l, t))
+            .map(|mut line| {
+                line.spans.insert(0, Span::styled("  │ ", Style::new().fg(t.faint)));
+                line
+            })
+            .collect()
     }
 
     /// All workers at once: busy ones first, then the newest, up to six panes.
@@ -618,7 +658,7 @@ impl App {
         if self.workers.is_empty() {
             let text = vec![
                 Line::styled("No workers yet.", Style::new().fg(t.text).bold()),
-                Line::styled("Give the manager a job; the workers it creates show up here, live.", Style::new().fg(t.dim)),
+                Line::styled("Message the manager; the workers it creates show up here, live.", Style::new().fg(t.dim)),
             ];
             return f.render_widget(Paragraph::new(text), area);
         }
@@ -639,43 +679,56 @@ impl App {
             let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*row);
             for (c, cell) in cells.iter().enumerate() {
                 let w = &self.workers[shown[r * cols + c]];
-                let block = Block::bordered()
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::new().fg(t.faint))
-                    .title({
-                        let mut title = self.worker_title(w);
-                        title.spans.insert(0, Span::raw(" "));
-                        title.spans.push(Span::raw(" "));
-                        title
-                    })
-                    .title_top(Line::styled(format!(" {} ", self.worker_time(w)), Style::new().fg(t.dim)).right_aligned());
+                let mut title = self.worker_title(w);
+                title.spans.insert(0, Span::raw(" "));
+                let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t.faint)).title(title);
                 let inner = block.inner(*cell).inner(Margin::new(1, 0));
                 f.render_widget(block, *cell);
                 // only the tail matters in a pane, and wrapping thousands of lines every frame is slow
-                render_scrolled(f, self.output_lines(w, 200), inner, 0);
+                let tail = &w.output[w.output.len().saturating_sub(200)..];
+                let mut lines: Vec<Line> = tail.iter().filter_map(|l| worker_line(l, t)).collect();
+                if lines.is_empty() {
+                    let note = if w.state.is_none() { "Queued: starts when the earlier steps finish" } else { "Starting…" };
+                    lines.push(Line::styled(note, Style::new().fg(t.dim)));
+                }
+                render_scrolled(f, lines, inner, 0);
             }
         }
     }
 
-    /// One worker: its title and task, then its full output with scrollback.
+    /// One worker's own thread: the manager's orders, its work log while it works, and its reply.
     fn draw_worker_tab(&self, f: &mut Frame, area: Rect, i: usize) {
-        let t = self.t();
         let w = &self.workers[i];
-        let mut title = self.worker_title(w);
-        title.spans.push(Span::styled(format!(" · {}", self.worker_time(w)), Style::new().fg(t.dim)));
-        let task = Paragraph::new(vec![
-            title,
-            Line::from(vec![
-                Span::styled("  ⎿  ", Style::new().fg(t.dim)),
-                Span::styled(format!("step {} · ", w.step), Style::new().fg(t.dim)),
-                Span::styled(w.task.clone(), Style::new().fg(t.text)),
-            ]),
-        ])
-        .wrap(Wrap { trim: false });
-        let task_height = (task.line_count(area.width) as u16).min(area.height / 3).max(2);
-        let [task_area, _, out] = Layout::vertical([Constraint::Length(task_height), Constraint::Length(1), Constraint::Min(1)]).areas(area);
-        f.render_widget(task, task_area);
-        render_scrolled(f, self.output_lines(w, MAX_OUTPUT_LINES), out, w.scroll_back);
+        let [title, _, body] = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).areas(area);
+        f.render_widget(self.worker_title(w), title);
+
+        let mine = |e: &&Entry| matches!(e, Entry::Task(t, _) if t.worker == w.name) || matches!(e, Entry::Reply { worker, .. } if *worker == w.name);
+        let entries: Vec<&Entry> = self.chat.iter().filter(mine).collect();
+        let last_task = entries.iter().rposition(|e| matches!(e, Entry::Task(..)));
+        // the log is everything before the reply; while working that's all of it
+        let log_end = if matches!(w.state, Some(State::Done | State::Failed)) { reply_start(&w.output) } else { w.output.len() };
+        let mut lines = vec![];
+        for (n, entry) in entries.iter().enumerate() {
+            match entry {
+                Entry::Task(task, state) => {
+                    lines.push(self.header("manager", &w.name, self.task_status(task, *state)));
+                    lines.extend(self.body(&task.task, body.width, false));
+                    lines.push(self.owns(task));
+                    // ponytail: the whole log goes under the latest orders; split it per round if workers get reused a lot
+                    if Some(n) == last_task {
+                        lines.push(Line::default());
+                        lines.extend(self.work_log(&w.output[..log_end]));
+                    }
+                }
+                Entry::Reply { text, .. } => {
+                    lines.push(self.header(&w.name, "manager", vec![]));
+                    lines.extend(self.body(text, body.width, true));
+                }
+                Entry::Line(..) => {}
+            }
+            lines.push(Line::default());
+        }
+        render_scrolled(f, lines, body, w.scroll_back);
     }
 
     /// Claude Code style selection list: `❯` on the chosen row.
@@ -703,12 +756,24 @@ impl App {
             Block::bordered()
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(t.accent))
-                .padding(ratatui::widgets::Padding::uniform(1))
+                .padding(Padding::uniform(1))
                 .title(Span::styled(title, Style::new().fg(t.text).bold()))
                 .title_bottom(Line::styled(" ↑↓ to select · enter to confirm · esc to cancel ", Style::new().fg(t.dim))),
         );
         f.render_stateful_widget(list, area, &mut ListState::default().with_selected(Some(p.sel)));
     }
+}
+
+/// Is this a line of a worker's activity (a tool call, a banner) rather than prose it wrote?
+fn is_activity(line: &str) -> bool {
+    let s = line.trim_start();
+    (s.starts_with("> ") && s.contains(" · "))
+        || ["Thinking:", "Error:", "→ ", "← ", "⚙ ", "✱ ", "✓ ", "$ ", "──"].iter().any(|p| s.starts_with(p))
+}
+
+/// Where a worker's reply starts: the prose after its last action.
+fn reply_start(output: &[String]) -> usize {
+    output.iter().rposition(|l| is_activity(l)).map_or(0, |i| i + 1)
 }
 
 /// `Read notes.md` → `⏺ Read(notes.md)`, with the dot in `color`.
@@ -737,12 +802,37 @@ fn worker_line(line: &str, t: &Theme) -> Option<Line<'static>> {
         return Some(tool_line(action, t.good, t));
     }
     if s.starts_with("Error") || s.starts_with("✗") || s.starts_with("no output for") || s.starts_with("timed out") {
-        return Some(Line::from(vec![Span::styled("  ⎿  ", Style::new().fg(t.dim)), Span::styled(s.to_string(), Style::new().fg(t.bad))]));
+        return Some(Line::from(vec![Span::styled("⎿  ", Style::new().fg(t.dim)), Span::styled(s.to_string(), Style::new().fg(t.bad))]));
     }
     if s.starts_with("──") {
         return Some(Line::styled(s.to_string(), Style::new().fg(t.faint)));
     }
-    Some(Line::styled(format!("  {line}"), Style::new().fg(t.text)))
+    Some(Line::styled(line.to_string(), Style::new().fg(t.dim)))
+}
+
+/// Greedy word wrap, keeping line breaks and indentation; a bullet's wrapped lines line up after the "- ".
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(10);
+    let mut out = vec![];
+    for line in text.lines() {
+        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let bullet = ["- ", "* "].iter().any(|b| line.trim_start().starts_with(b));
+        let hang = if bullet { format!("{indent}  ") } else { indent.clone() };
+        let (mut cur, mut fresh) = (indent.clone(), true);
+        for word in line.split_whitespace() {
+            if !fresh && cur.chars().count() + 1 + word.chars().count() > width {
+                out.push(std::mem::replace(&mut cur, hang.clone()));
+                fresh = true;
+            }
+            if !fresh {
+                cur.push(' ');
+            }
+            cur.push_str(word);
+            fresh = false;
+        }
+        out.push(cur);
+    }
+    out
 }
 
 /// Wrap lines into `area`, pinned to the bottom unless scrolled up by `scroll_back` lines.
@@ -817,6 +907,20 @@ fn inline(text: &str, base: Style, t: &Theme) -> Vec<Span<'static>> {
     spans
 }
 
+/// `12.3k tokens`, plus the cost when the CLI reports one; empty when nothing was used.
+fn tokens(u: Usage) -> String {
+    let n = u.input + u.output;
+    if n == 0 {
+        return String::new();
+    }
+    let count = match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", n as f64 / 1e3),
+        _ => format!("{:.1}M", n as f64 / 1e6),
+    };
+    if u.cost >= 0.005 { format!("{count} tokens (${:.2})", u.cost) } else { format!("{count} tokens") }
+}
+
 fn fmt_duration(d: Duration) -> String {
     let s = d.as_secs();
     if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
@@ -855,8 +959,7 @@ fn main() -> std::io::Result<()> {
         workers: Vec::new(),
         tab: MANAGER_TAB,
         manager: None,
-        thinking: None,
-        live: String::new(),
+        manager_usage: Usage::default(),
         scroll_back: 0,
         input: String::new(),
         cursor: 0,
@@ -913,9 +1016,38 @@ mod tests {
         assert_eq!(line("Thinking: read it first"), Some("✻ read it first".into()));
         assert_eq!(line("← Write calc.py"), Some("⏺ Write(calc.py)".into()));
         assert_eq!(line("$ python3 -m pytest"), Some("⏺ Bash(python3 -m pytest)".into()));
-        assert_eq!(line("Error: nope"), Some("  ⎿  Error: nope".into()));
-        assert_eq!(line("plain"), Some("  plain".into()));
+        assert_eq!(line("Error: nope"), Some("⎿  Error: nope".into()));
         assert_eq!(text(&tool_line("Read notes.md", t.good, t)), "⏺ Read(notes.md)");
+    }
+
+    /// The reply is the prose after a worker's last action.
+    #[test]
+    fn finds_worker_reply() {
+        let out: Vec<String> = ["> build · m", "→ Read notes.md", "← Write calc.py", "Created file successfully: calc.py", "> build · m", "Done. calc.py has", "add and sub."]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(out[reply_start(&out)..].join(" "), "Done. calc.py has add and sub.");
+        assert_eq!(reply_start(&["just text".to_string()]), 0);
+        assert_eq!(reply_start(&["→ Read x".to_string()]), 1);
+        let failed: Vec<String> = ["⚙ Write a.py", "Error: no tool named finish", "All done."].iter().map(|s| s.to_string()).collect();
+        assert_eq!(failed[reply_start(&failed)..], ["All done."]);
+    }
+
+    #[test]
+    fn wraps_text() {
+        assert_eq!(wrap("one two three four", 10), ["one two", "three four"]);
+        assert_eq!(wrap("- one two three four", 12), ["- one two", "  three four"]);
+        assert_eq!(wrap("a\n  b c", 20), ["a", "  b c"]);
+        assert!(wrap("", 20).is_empty());
+    }
+
+    #[test]
+    fn formats_tokens() {
+        assert_eq!(tokens(Usage::default()), "");
+        assert_eq!(tokens(Usage { input: 800, output: 50, cost: 0.0 }), "850 tokens");
+        assert_eq!(tokens(Usage { input: 109_528, output: 10, cost: 0.1077 }), "109.5k tokens ($0.11)");
+        assert_eq!(tokens(Usage { input: 2_000_000, output: 0, cost: 0.0 }), "2.0M tokens");
     }
 
     #[test]

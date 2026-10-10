@@ -2,12 +2,12 @@
 
 [![CI](https://github.com/GbaGuy/foreman/actions/workflows/ci.yml/badge.svg)](https://github.com/GbaGuy/foreman/actions/workflows/ci.yml)
 
-A terminal UI, written in Rust, where you talk to one AI **manager** and it gets the work done with a team of AI **workers** that it creates as needed.
+A terminal UI, written in Rust, where you talk to one AI **manager** and it gets the work done with a team of AI **workers** that it creates, commands and keeps track of.
 
 - You only see and talk to the manager.
-- The manager is Claude. It doesn't do the work itself: for each job it creates workers, gives each a name, a role and a task, and runs them in parallel, or in steps when one depends on another (a tester after a builder, for example).
-- After each round it reviews the work. It reads every worker's output and reasoning, then checks the actual files with its read tools instead of trusting what workers claim. If something is wrong or missing, it creates workers to fix it in another round, up to `max_rounds`.
-- You see everything live: the manager thinking, the files it reads, and its reply as it writes, plus a pane per worker showing its reasoning and every action.
+- The manager is Claude. It doesn't do the work itself: for each job it creates workers, sends each one its orders (a role, a task, and the files it owns), and runs them in parallel, or in steps when one depends on another (a tester after a builder, for example).
+- Workers run in parallel without stepping on each other. Each one may only create or edit the files the manager gave it, and if two workers in the same step claim the same file, foreman makes them take turns. After every step foreman records which files really changed and who owned them, and flags any change nobody owned.
+- Every worker ends with a report to the manager. The manager reviews the reports and foreman's file record, checks the actual files with its read tools, and sends workers new orders to fix anything wrong, up to `max_rounds`.
 - For a question or chat that needs no work, it just answers. It remembers the conversation.
 
 ```
@@ -61,9 +61,11 @@ Run `foreman` in the folder you want the work done in.
 | `Ctrl+T` | Switches the colour theme (claude, tokyo-night, catppuccin) |
 | `Ctrl+Q` | Quits |
 
-The look follows Claude Code: a flowing transcript with `>` for your messages, `⏺` for the manager's replies and the files it reads (`⏺ Read(notes.md)`), each round as a to-do list (☐ queued, ◼ working, ☒ done, ✗ failed), and an orange `✻ Planning… (12s · ctrl+s to stop)` spinner above a plain prompt box. Tabs switch between the **Manager** transcript, a **Workers** overview (every worker live, up to six panes) and one tab per worker with its task and full output. Worker output is shown the same way: reasoning as `✻`, actions as `⏺ Write(calc.py)`, errors in red. You can type to the manager from any tab, and `ctrl+t` cycles colour themes (claude, tokyo-night, catppuccin).
+The main view is a **team chat** in Claude Code's style: `you → manager`, `manager → builder` (the orders, the files it owns, and live status: queued, working 12s, done, failed, with tokens used), `builder → manager` (the worker's report), and `manager → you` (the summary). Each worker has its own colour, and foreman notes which files each step changed. An orange `✻ builder, tester working… (40s · ctrl+s to stop)` spinner sits above a plain `>` prompt box.
 
-The manager streams too: `💭 thinking (~N tokens)`, each file it reads or searches (`→ Read notes.md`), then its reply as it's written. Claude Code doesn't hand out the text of Claude's thinking, only that it's thinking and roughly how much; the workers' opencode models do show their full reasoning. Manager replies are shown with basic Markdown formatting.
+Tabs switch between the **Team chat**, a **Workers** overview (every worker live, up to six panes), and one tab per worker showing its conversation with the manager and its work log (`⏺ Write(calc.py)`, `⏺ Bash(pytest)`, errors in red). Token usage shows for each worker and, at the bottom right, for the manager and the workers in total (with the cost when the CLI reports one). You can type to the manager from any tab, and `ctrl+t` cycles colour themes (claude, tokyo-night, catppuccin).
+
+Replies are shown with basic Markdown formatting.
 
 ## Configure
 
@@ -72,16 +74,16 @@ Settings live in `~/.config/foreman/crew.json`:
 ```json
 {
   "max_rounds": 3,
-  "manager": "claude -p --output-format stream-json --verbose --include-partial-messages --tools=Read,Grep,Glob {prompt}",
-  "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto --thinking {prompt}",
+  "manager": "claude -p --output-format json --tools=Read,Grep,Glob {prompt}",
+  "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto --format json {prompt}",
   "max_parallel": 4,
   "worker_timeout_mins": 20,
   "worker_idle_mins": 5
 }
 ```
 
-- `manager` runs Claude with read-only tools, so it can look at the project to plan and check work but can't edit files or run commands. `stream-json` is what makes its activity show live; without it you only see the final reply. Keep the `=` in `--tools=...`: without it the flag swallows the prompt.
-- `worker` is the command every worker runs. Workers need permission to act, which is what `--auto` gives opencode; `--thinking` makes their reasoning visible. You can use any agent CLI here, for example `claude -p --permission-mode acceptEdits {prompt}` or `codex exec {prompt}`.
+- `manager` runs Claude with read-only tools, so it can look at the project to plan and check work but can't edit files or run commands. `--output-format json` is how foreman reads its token usage.
+- `worker` is the command every worker runs. Workers need permission to act, which is what `--auto` gives opencode; `--format json` lets foreman show each action and count tokens. Any other agent CLI works too (its output is shown as plain text, without token counts), for example `claude -p --permission-mode acceptEdits {prompt}` or `codex exec {prompt}`.
 - `max_rounds` caps how many plan, work, review rounds one message can take.
 - `max_parallel` caps how many workers run at once; the rest wait their turn.
 - `worker_timeout_mins` kills a worker that runs longer than this.
