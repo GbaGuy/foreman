@@ -23,10 +23,10 @@ By default the manager runs on a free [opencode](https://opencode.ai) model in o
 │                                ││                                                                │
 │                                ││                                                                │
 ╰────────────────────────────────╯╰────────────────────────────────────────────────────────────────╯
-╭ goal ────────────────────────────────────────────────────────────────────────────────────────────╮
-│Goal for the manager…  (or @worker message to talk to one directly)                               │
+╭ to manager ──────────────────────────────────────────────────────────────────────────────────────╮
+│Tell the manager what you need…                                                                   │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- ^N add  ^R remove  ^S stop  ^T theme  Tab switch  PgUp/Dn scroll  ^Q quit            Crew finished
+ ^N add  ^R remove  ^O model  ^S stop  ^T theme  Tab switch  PgUp/Dn scroll  ^Q quit            Crew finished
 ```
 
 Each agent is a CLI command with `{prompt}` in it, so any agent CLI works: `claude`, `codex`, `opencode`, or your own script. You can mix them, for example a Claude manager running Codex coders.
