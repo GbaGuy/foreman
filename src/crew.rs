@@ -44,6 +44,9 @@ pub struct Crew {
     /// A worker running longer than this is killed.
     #[serde(default = "default_timeout")]
     pub worker_timeout_mins: u64,
+    /// A worker that prints nothing for this long is killed (some agent CLIs hang after finishing).
+    #[serde(default = "default_idle")]
+    pub worker_idle_mins: u64,
 }
 
 fn default_rounds() -> u32 {
@@ -56,6 +59,10 @@ fn default_parallel() -> usize {
 
 fn default_timeout() -> u64 {
     20
+}
+
+fn default_idle() -> u64 {
+    5
 }
 
 impl Crew {
@@ -74,6 +81,7 @@ impl Crew {
                 worker: WORKER_COMMAND.into(),
                 max_parallel: default_parallel(),
                 worker_timeout_mins: default_timeout(),
+                worker_idle_mins: default_idle(),
             })
     }
 
@@ -261,9 +269,9 @@ pub fn opencode_models() -> Result<Vec<(String, &'static str)>, String> {
     if models.is_empty() { Err("opencode listed no models".into()) } else { Ok(models) }
 }
 
-/// Run a CLI agent to completion, handing each output line to `on_line`;
-/// return (ok, all output with escapes stripped).
-pub async fn run_command(command: &str, prompt: &str, on_line: impl Fn(&str)) -> (bool, String) {
+/// Run a CLI agent to completion, handing each output line to `on_line`; kill it if it
+/// goes quiet for longer than `idle`. Return (ok, all output with escapes stripped).
+pub async fn run_command(command: &str, prompt: &str, idle: Option<Duration>, on_line: impl Fn(&str)) -> (bool, String) {
     let Some(argv) = build_argv(command, prompt) else {
         return (false, format!("bad command: {command}"));
     };
@@ -282,7 +290,22 @@ pub async fn run_command(command: &str, prompt: &str, on_line: impl Fn(&str)) ->
     let mut out = String::new();
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut buf = Vec::new();
-    while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
+    loop {
+        let read = reader.read_until(b'\n', &mut buf);
+        let n = match idle {
+            None => read.await.unwrap_or(0),
+            Some(limit) => match tokio::time::timeout(limit, read).await {
+                Ok(n) => n.unwrap_or(0),
+                Err(_) => {
+                    child.kill().await.ok();
+                    out.push_str(&format!("no output for {}s, stopped\n", limit.as_secs()));
+                    return (false, out);
+                }
+            },
+        };
+        if n == 0 {
+            break;
+        }
         let line = strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    ");
         on_line(&line);
         out.push_str(&line);
@@ -304,6 +327,7 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
     steps.dedup();
     let slots = Arc::new(Semaphore::new(crew.max_parallel.max(1)));
     let timeout = Duration::from_secs(crew.worker_timeout_mins.max(1) * 60);
+    let idle = Some(Duration::from_secs(crew.worker_idle_mins.max(1) * 60));
     for step in steps {
         let batch: Vec<&Task> = plan.iter().filter(|t| t.step == step).collect();
         // ponytail: only the last 12k chars of history go to workers; summarise rounds if that loses context
@@ -323,7 +347,7 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
                 let _slot = slots.acquire_owned().await;
                 tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), State::Working)).ok();
                 let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
-                let (ok, out) = tokio::time::timeout(timeout, run_command(&command, &prompt, echo))
+                let (ok, out) = tokio::time::timeout(timeout, run_command(&command, &prompt, idle, echo))
                     .await
                     .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60)));
                 tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), if ok { State::Done } else { State::Failed })).ok();
@@ -403,7 +427,7 @@ async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (b
             tx.send(msg).ok();
         }
     };
-    let (ok, out) = run_command(&crew.manager, prompt, live).await;
+    let (ok, out) = run_command(&crew.manager, prompt, None, live).await;
     let (ok, reply) = match streaming.then(|| stream_result(&out)).flatten() {
         Some((good, text)) => (ok && good, text),
         None => (ok, out),
@@ -525,6 +549,7 @@ mod tests {
             worker: "echo DID {prompt}".into(),
             max_parallel: 4,
             worker_timeout_mins: 1,
+            worker_idle_mins: 1,
         };
         let (tx, mut rx) = unbounded_channel();
         orchestrate(crew, "ship it".into(), String::new(), tx).await;
@@ -535,6 +560,17 @@ mod tests {
         assert!(msgs.iter().any(|m| matches!(m, Msg::Thinking(30))));
         assert!(chat(&msgs).contains("→ Read notes.md") && chat(&msgs).contains("All done."));
         assert!(workers(&msgs).contains(&("coder", State::Done)));
+    }
+
+    /// A CLI that prints its answer and then hangs is killed once it goes quiet, output kept.
+    #[tokio::test]
+    async fn kills_quiet_command() {
+        let start = std::time::Instant::now();
+        let (ok, out) = run_command("sh -c 'echo answer; sleep 5' sh {prompt}", "p", Some(Duration::from_millis(300)), |_| ()).await;
+        assert!(!ok && out.starts_with("answer\n") && out.contains("no output for"));
+        assert!(start.elapsed() < Duration::from_secs(2));
+        let (ok, out) = run_command("echo fine {prompt}", "p", Some(Duration::from_secs(5)), |_| ()).await;
+        assert!(ok && out == "fine p\n");
     }
 
     #[test]
@@ -566,6 +602,7 @@ mod tests {
             worker: "echo DID {prompt}".into(),
             max_parallel: 4,
             worker_timeout_mins: 1,
+            worker_idle_mins: 1,
         };
         let (tx, mut rx) = unbounded_channel();
         orchestrate(crew, goal.into(), "User: earlier\nManager: ok".into(), tx).await;
@@ -623,6 +660,7 @@ mod tests {
                 worker: "sh -c 'sleep 0.3' sh {prompt}".into(),
                 max_parallel: slots,
                 worker_timeout_mins: 1,
+                worker_idle_mins: 1,
             };
             let (tx, _rx) = unbounded_channel();
             let start = std::time::Instant::now();
@@ -642,6 +680,7 @@ mod tests {
             worker: format!("sh -c 'sleep 0.6; touch {}' sh {{prompt}}", marker.display()),
             max_parallel: 4,
             worker_timeout_mins: 1,
+            worker_idle_mins: 1,
         };
         let plan = vec![Task { worker: "w".into(), role: String::new(), task: "t".into(), step: 1 }];
         let (tx, _rx) = unbounded_channel();

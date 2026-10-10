@@ -76,7 +76,8 @@ Settings live in `~/.config/foreman/crew.json`:
   "manager": "claude -p --output-format stream-json --verbose --include-partial-messages --tools=Read,Grep,Glob {prompt}",
   "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto --thinking {prompt}",
   "max_parallel": 4,
-  "worker_timeout_mins": 20
+  "worker_timeout_mins": 20,
+  "worker_idle_mins": 5
 }
 ```
 
@@ -85,6 +86,7 @@ Settings live in `~/.config/foreman/crew.json`:
 - `max_rounds` caps how many plan, work, review rounds one message can take.
 - `max_parallel` caps how many workers run at once; the rest wait their turn.
 - `worker_timeout_mins` kills a worker that runs longer than this.
+- `worker_idle_mins` kills a worker that prints nothing for this long. Some agent CLIs finish their work and then never exit; this frees the job, and the manager still gets everything the worker printed.
 
 Commands run without a shell, and the prompt is passed as a single argument.
 
