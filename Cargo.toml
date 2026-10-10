@@ -2,6 +2,14 @@
 name = "foreman"
 version = "0.1.0"
 edition = "2024"
+description = "A terminal UI where one Claude manager creates and directs a team of AI worker agents"
+repository = "https://github.com/GbaGuy/foreman"
+keywords = ["ai", "agents", "tui", "claude", "opencode"]
+categories = ["command-line-utilities"]
+
+[profile.release]
+lto = true
+strip = true
 
 [dependencies]
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }

@@ -7,16 +7,16 @@
 mod crew;
 
 use crew::{Crew, Kind, Msg, State};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::task::JoinHandle;
 
 struct Theme {
     name: &'static str,
@@ -47,6 +47,7 @@ const THEMES: [Theme; 3] = [
 ];
 
 const SPINNER: [&str; 4] = ["◐", "◓", "◑", "◒"];
+const MAX_OUTPUT_LINES: usize = 5_000;
 
 /// A model picker for the manager (Claude models) or the workers (opencode models).
 struct Picker {
@@ -55,17 +56,41 @@ struct Picker {
     sel: usize,
 }
 
+/// One worker of the current job, as the UI tracks it.
+struct Worker {
+    name: String,
+    role: String,
+    state: State,
+    started: Instant,
+    took: Option<Duration>,
+    output: Vec<String>,
+}
+
+impl Worker {
+    fn elapsed(&self) -> Duration {
+        self.took.unwrap_or_else(|| self.started.elapsed())
+    }
+}
+
+/// The worker output viewer: which worker, and how far it's scrolled up.
+struct Viewer {
+    worker: usize,
+    scroll_back: u16,
+}
+
 struct App {
     crew: Crew,
     chat: Vec<(Kind, String)>,
-    workers: Vec<(String, String, State)>, // this run's workers: name, role, state
+    workers: Vec<Worker>,
     manager: Option<State>,
     scroll_back: u16, // lines scrolled up from the bottom of the chat
     input: String,
+    cursor: usize, // in chars
     busy: bool,
-    stop: Arc<AtomicBool>,
+    job: Option<JoinHandle<()>>,
     toast: Option<(String, Instant)>,
     picker: Option<Picker>,
+    viewer: Option<Viewer>,
     history: String, // past user/manager exchanges, fed back to the manager
     theme: usize,
     cwd: String,
@@ -92,10 +117,35 @@ impl App {
         match msg {
             Msg::Log(kind, text) => self.chat.push((kind, text)),
             Msg::Manager(state) => self.manager = Some(state),
-            Msg::Worker(name, role, state) => match self.workers.iter_mut().find(|w| w.0 == name) {
-                Some(w) => (w.1, w.2) = (role, state),
-                None => self.workers.push((name, role, state)),
-            },
+            Msg::Worker(name, role, state) => {
+                let i = match self.workers.iter().position(|w| w.name == name) {
+                    Some(i) => i,
+                    None => {
+                        let output = Vec::new();
+                        self.workers.push(Worker { name, role: role.clone(), state, started: Instant::now(), took: None, output });
+                        self.workers.len() - 1
+                    }
+                };
+                let w = &mut self.workers[i];
+                if state == State::Working && w.state != State::Working {
+                    // the manager reused a name in a later round: same worker, new run
+                    if !w.output.is_empty() {
+                        w.output.push(format!("── new task as {role} ──"));
+                    }
+                    (w.started, w.took) = (Instant::now(), None);
+                } else if state != State::Working {
+                    w.took = Some(w.started.elapsed());
+                }
+                (w.role, w.state) = (role, state);
+            }
+            Msg::Output(name, line) => {
+                if let Some(w) = self.workers.iter_mut().find(|w| w.name == name) {
+                    w.output.push(line);
+                    if w.output.len() > MAX_OUTPUT_LINES {
+                        w.output.drain(..1_000);
+                    }
+                }
+            }
             Msg::Notify(text) => self.toast(text),
             Msg::Remember(text) => {
                 self.history.push_str(&text);
@@ -105,7 +155,7 @@ impl App {
                 let cut = (cut..self.history.len()).find(|&i| self.history.is_char_boundary(i)).unwrap_or(0);
                 self.history.drain(..cut);
             }
-            Msg::Finished => self.busy = false,
+            Msg::Finished => (self.busy, self.job) = (false, None),
         }
     }
 
@@ -114,28 +164,54 @@ impl App {
         if self.picker.is_some() {
             return self.picker_key(k);
         }
+        if self.viewer.is_some() {
+            return self.viewer_key(k);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let len = self.input.chars().count();
         match k.code {
             KeyCode::Char('q' | 'c') if ctrl => self.quit = true,
             KeyCode::Char('o') if ctrl => self.open_picker(true),
             KeyCode::Char('w') if ctrl => self.open_picker(false),
-            KeyCode::Char('s') if ctrl && self.busy => {
-                self.stop.store(true, Ordering::Relaxed);
-                self.toast("Stopping after the running workers finish");
-            }
+            KeyCode::Char('s') if ctrl => self.stop(),
             KeyCode::Char('t') if ctrl => {
                 self.theme = (self.theme + 1) % THEMES.len();
                 self.toast(format!("theme: {}", self.t().name));
             }
-            KeyCode::Char('u') if ctrl => self.input.clear(),
-            KeyCode::PageUp | KeyCode::Up => self.scroll_back = self.scroll_back.saturating_add(if k.code == KeyCode::Up { 1 } else { 10 }),
-            KeyCode::PageDown | KeyCode::Down => self.scroll_back = self.scroll_back.saturating_sub(if k.code == KeyCode::Down { 1 } else { 10 }),
-            KeyCode::End => self.scroll_back = 0,
+            KeyCode::Char('u') if ctrl => (self.input, self.cursor) = (String::new(), 0),
+            KeyCode::Char('a') if ctrl => self.cursor = 0,
+            KeyCode::Char('e') if ctrl => self.cursor = len,
+            KeyCode::Tab => self.open_viewer(),
+            KeyCode::Up => self.scroll_back = self.scroll_back.saturating_add(1),
+            KeyCode::Down => self.scroll_back = self.scroll_back.saturating_sub(1),
+            KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
+            KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
+            KeyCode::Esc => self.scroll_back = 0,
+            KeyCode::Left => self.cursor = self.cursor.saturating_sub(1),
+            KeyCode::Right => self.cursor = (self.cursor + 1).min(len),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = len,
             KeyCode::Enter => self.submit(),
-            KeyCode::Backspace => _ = self.input.pop(),
-            KeyCode::Char(c) if !ctrl => self.input.push(c),
+            KeyCode::Backspace if self.cursor > 0 => {
+                self.cursor -= 1;
+                self.input.remove(self.byte_at(self.cursor));
+            }
+            KeyCode::Delete if self.cursor < len => _ = self.input.remove(self.byte_at(self.cursor)),
+            KeyCode::Char(c) if !ctrl => self.insert(&c.to_string()),
             _ => {}
         }
+    }
+
+    fn byte_at(&self, char_idx: usize) -> usize {
+        self.input.char_indices().nth(char_idx).map_or(self.input.len(), |(i, _)| i)
+    }
+
+    /// Insert at the cursor; pasted line breaks become spaces so a paste never sends early.
+    fn insert(&mut self, text: &str) {
+        let text: String = text.chars().map(|c| if c == '\n' || c == '\r' { ' ' } else { c }).filter(|c| !c.is_control()).collect();
+        let at = self.byte_at(self.cursor);
+        self.input.insert_str(at, &text);
+        self.cursor += text.chars().count();
     }
 
     fn submit(&mut self) {
@@ -144,15 +220,53 @@ impl App {
             return;
         }
         if self.busy {
-            return self.toast("The manager is still working");
+            return self.toast("The manager is still working (Ctrl+S stops it)");
         }
-        self.stop.store(false, Ordering::Relaxed);
         self.workers.clear();
         self.scroll_back = 0;
         self.chat.extend([(Kind::Out, String::new()), (Kind::User, format!("you › {text}"))]);
-        self.rt.spawn(crew::orchestrate(self.crew.clone(), text, self.history.clone(), self.tx.clone(), self.stop.clone()));
+        self.job = Some(self.rt.spawn(crew::orchestrate(self.crew.clone(), text, self.history.clone(), self.tx.clone())));
         self.busy = true;
-        self.input.clear();
+        (self.input, self.cursor) = (String::new(), 0);
+    }
+
+    /// Abort the job; dropping it kills the manager and any running workers.
+    fn stop(&mut self) {
+        let Some(job) = self.job.take() else { return };
+        job.abort();
+        self.busy = false;
+        self.manager = None;
+        for w in self.workers.iter_mut().filter(|w| w.state == State::Working) {
+            (w.state, w.took) = (State::Failed, Some(w.started.elapsed()));
+            w.output.push("── stopped ──".into());
+        }
+        self.chat.push((Kind::Warn, "Stopped. Running workers were killed.".into()));
+    }
+
+    fn open_viewer(&mut self) {
+        if self.workers.is_empty() {
+            return self.toast("No workers yet");
+        }
+        // start on a worker that's busy, else the latest one
+        let worker = self.workers.iter().position(|w| w.state == State::Working).unwrap_or(self.workers.len() - 1);
+        self.viewer = Some(Viewer { worker, scroll_back: 0 });
+    }
+
+    fn viewer_key(&mut self, k: KeyEvent) {
+        let n = self.workers.len();
+        let v = self.viewer.as_mut().unwrap();
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.viewer = None,
+            KeyCode::Right | KeyCode::Tab => (v.worker, v.scroll_back) = ((v.worker + 1) % n, 0),
+            KeyCode::Left | KeyCode::BackTab => (v.worker, v.scroll_back) = ((v.worker + n - 1) % n, 0),
+            KeyCode::Up => v.scroll_back = v.scroll_back.saturating_add(1),
+            KeyCode::Down => v.scroll_back = v.scroll_back.saturating_sub(1),
+            KeyCode::PageUp => v.scroll_back = v.scroll_back.saturating_add(10),
+            KeyCode::PageDown => v.scroll_back = v.scroll_back.saturating_sub(10),
+            KeyCode::End => v.scroll_back = 0,
+            KeyCode::Char('c') if k.modifiers.contains(KeyModifiers::CONTROL) => self.quit = true,
+            _ => {}
+        }
     }
 
     fn open_picker(&mut self, for_manager: bool) {
@@ -233,39 +347,56 @@ impl App {
         if strip > 0 {
             self.draw_workers(f, workers);
         }
+        self.draw_input(f, input);
 
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(t.accent))
-            .title(Span::styled(" to manager ", Style::new().fg(t.accent).bold()));
-        let (text, style) = if self.input.is_empty() {
-            ("Tell the manager what you need…", Style::new().fg(t.dim))
-        } else {
-            (self.input.as_str(), Style::new().fg(t.text))
-        };
-        let inner = block.inner(input);
-        // keep the end of a long line in view
-        let skip = self.input.chars().count().saturating_sub(inner.width.saturating_sub(1) as usize);
-        f.render_widget(Paragraph::new(Span::styled(text.chars().skip(skip).collect::<String>(), style)).block(block), input);
-        if self.picker.is_none() {
-            let x = inner.x + (self.input.chars().count() - skip) as u16;
-            f.set_cursor_position(Position::new(x, inner.y));
+        let mut keys = vec![("^O", "manager model"), ("^W", "worker model")];
+        if !self.workers.is_empty() {
+            keys.push(("Tab", "worker output"));
         }
-
-        let keys = [("^O", "manager model"), ("^W", "worker model"), ("^S", "stop"), ("^T", "theme"), ("↑↓/PgUp/PgDn", "scroll"), ("^Q", "quit")];
+        if self.busy {
+            keys.push(("^S", "stop"));
+        }
+        keys.extend([("^T", "theme"), ("PgUp/PgDn", "scroll"), ("^Q", "quit")]);
         let spans: Vec<Span> = keys
             .iter()
             .flat_map(|(k, d)| [Span::styled(format!(" {k}"), Style::new().fg(t.accent).bold()), Span::styled(format!(" {d} "), Style::new().fg(t.dim))])
             .collect();
-        f.render_widget(Line::from(spans), footer);
-        if let Some((msg, at)) = &self.toast
-            && at.elapsed() < Duration::from_secs(4)
-        {
-            f.render_widget(Line::styled(format!("{msg} "), Style::new().fg(t.info)).right_aligned(), footer);
+        // a fresh toast takes the right of the footer; the key hints get what's left
+        let toast = self.toast.as_ref().filter(|(_, at)| at.elapsed() < Duration::from_secs(4));
+        let width = toast.map_or(0, |(msg, _)| msg.chars().count() as u16 + 2);
+        let [keys_area, toast_area] = Layout::horizontal([Constraint::Min(0), Constraint::Length(width)]).areas(footer);
+        f.render_widget(Line::from(spans), keys_area);
+        if let Some((msg, _)) = toast {
+            f.render_widget(Line::styled(format!(" {msg} "), Style::new().fg(t.info)).right_aligned(), toast_area);
         }
 
+        if let Some(v) = &self.viewer {
+            self.draw_viewer(f, v);
+        }
         if let Some(p) = &self.picker {
             self.draw_picker(f, p);
+        }
+    }
+
+    fn draw_input(&self, f: &mut Frame, area: Rect) {
+        let t = self.t();
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(t.accent))
+            .title(Span::styled(" to manager ", Style::new().fg(t.accent).bold()));
+        let inner = block.inner(area);
+        if self.input.is_empty() {
+            f.render_widget(Paragraph::new(Span::styled("Tell the manager what you need…", Style::new().fg(t.dim))).block(block), area);
+        } else {
+            // scroll horizontally so the cursor stays in view
+            let width = inner.width.saturating_sub(1) as usize;
+            let skip = self.cursor.saturating_sub(width);
+            let shown: String = self.input.chars().skip(skip).take(width + 1).collect();
+            f.render_widget(Paragraph::new(Span::styled(shown, Style::new().fg(t.text))).block(block), area);
+        }
+        if self.picker.is_none() && self.viewer.is_none() {
+            let skip = self.cursor.saturating_sub(inner.width.saturating_sub(1) as usize);
+            f.set_cursor_position(Position::new(inner.x + (self.cursor - skip) as u16, inner.y));
         }
     }
 
@@ -286,7 +417,7 @@ impl App {
             title.extend([self.icon(State::Working), Span::styled(" thinking ", Style::new().fg(t.warn))]);
         }
         let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t.primary)).title(Line::from(title));
-        let inner = block.inner(area).inner(ratatui::layout::Margin::new(1, 0));
+        let inner = block.inner(area).inner(Margin::new(1, 0));
         f.render_widget(block, area);
 
         let lines: Vec<Line> = if self.chat.is_empty() {
@@ -295,24 +426,20 @@ impl App {
                 Line::styled("Tell me what you need. I'll create workers, give each a role and a task, and report back.", Style::new().fg(t.dim)),
             ]
         } else {
+            let mut in_code = false;
             self.chat
                 .iter()
-                .map(|(kind, text)| {
-                    let style = match kind {
-                        Kind::User => Style::new().fg(t.accent).bold(),
-                        Kind::Out => Style::new().fg(t.text),
-                        Kind::Info => Style::new().fg(t.secondary),
-                        Kind::Good => Style::new().fg(t.good),
-                        Kind::Warn => Style::new().fg(t.warn),
-                        Kind::Bad => Style::new().fg(t.bad),
-                    };
-                    Line::styled(text.clone(), style)
+                .filter_map(|(kind, text)| match kind {
+                    Kind::Out => markdown(text, &mut in_code, t),
+                    Kind::User => Some(Line::styled(text.clone(), Style::new().fg(t.accent).bold())),
+                    Kind::Info => Some(Line::styled(text.clone(), Style::new().fg(t.secondary))),
+                    Kind::Good => Some(Line::styled(text.clone(), Style::new().fg(t.good))),
+                    Kind::Warn => Some(Line::styled(text.clone(), Style::new().fg(t.warn))),
+                    Kind::Bad => Some(Line::styled(text.clone(), Style::new().fg(t.bad))),
                 })
                 .collect()
         };
-        let para = Paragraph::new(lines).wrap(Wrap { trim: false });
-        let bottom = (para.line_count(inner.width) as u16).saturating_sub(inner.height);
-        f.render_widget(para.scroll((bottom.saturating_sub(self.scroll_back), 0)), inner);
+        render_scrolled(f, lines, inner, self.scroll_back);
     }
 
     fn draw_workers(&self, f: &mut Frame, area: Rect) {
@@ -322,19 +449,50 @@ impl App {
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(t.secondary))
             .title(Line::from(vec![Span::styled(" workers ", Style::new().fg(t.accent).bold()), Span::styled(format!("· {model} "), Style::new().fg(t.dim))]));
+        let inner = block.inner(area).inner(Margin::new(1, 0));
+        f.render_widget(block, area);
         let skip = self.workers.len().saturating_sub(6); // newest workers stay visible
-        let lines: Vec<Line> = self.workers[skip..]
+        let shown = &self.workers[skip..];
+        let names: Vec<Line> = shown
             .iter()
-            .map(|(name, role, state)| {
+            .map(|w| {
                 Line::from(vec![
-                    Span::raw(" "),
-                    self.icon(*state),
-                    Span::styled(format!(" {name:<14}"), Style::new().fg(t.text).bold()),
-                    Span::styled(role.clone(), Style::new().fg(t.dim)),
+                    self.icon(w.state),
+                    Span::styled(format!(" {:<14}", w.name), Style::new().fg(t.text).bold()),
+                    Span::styled(w.role.clone(), Style::new().fg(t.dim)),
                 ])
             })
             .collect();
-        f.render_widget(Paragraph::new(lines).block(block), area);
+        let times: Vec<Line> = shown.iter().map(|w| Line::styled(fmt_duration(w.elapsed()), Style::new().fg(t.dim)).right_aligned()).collect();
+        f.render_widget(Paragraph::new(names), inner);
+        f.render_widget(Paragraph::new(times), inner);
+    }
+
+    fn draw_viewer(&self, f: &mut Frame, v: &Viewer) {
+        let t = self.t();
+        let Some(w) = self.workers.get(v.worker) else { return };
+        let area = f.area().centered(Constraint::Percentage(90), Constraint::Percentage(85));
+        f.render_widget(Clear, area);
+        let title = Line::from(vec![
+            Span::raw(" "),
+            self.icon(w.state),
+            Span::styled(format!(" {} ", w.name), Style::new().fg(t.accent).bold()),
+            Span::styled(format!("· {} · {} ", w.role, fmt_duration(w.elapsed())), Style::new().fg(t.dim)),
+        ]);
+        let hint = format!(" {}/{} · ←/→ worker · ↑/↓ PgUp/PgDn scroll · Esc close ", v.worker + 1, self.workers.len());
+        let block = Block::bordered()
+            .border_type(BorderType::Thick)
+            .border_style(Style::new().fg(t.secondary))
+            .title(title)
+            .title_bottom(Line::styled(hint, Style::new().fg(t.dim)).right_aligned());
+        let inner = block.inner(area).inner(Margin::new(1, 0));
+        f.render_widget(block, area);
+        let lines: Vec<Line> = if w.output.is_empty() {
+            vec![Line::styled("No output yet.", Style::new().fg(t.dim))]
+        } else {
+            w.output.iter().map(|l| Line::styled(l.as_str(), Style::new().fg(t.text))).collect()
+        };
+        render_scrolled(f, lines, inner, v.scroll_back);
     }
 
     fn draw_picker(&self, f: &mut Frame, p: &Picker) {
@@ -369,6 +527,83 @@ impl App {
     }
 }
 
+/// Wrap lines into `area`, pinned to the bottom unless scrolled up by `scroll_back` lines.
+fn render_scrolled(f: &mut Frame, lines: Vec<Line>, area: Rect, scroll_back: u16) {
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let bottom = (para.line_count(area.width) as u16).saturating_sub(area.height);
+    f.render_widget(para.scroll((bottom.saturating_sub(scroll_back), 0)), area);
+}
+
+/// Just enough Markdown for chat replies: headings, bullets, **bold**, `code`, and ``` blocks.
+/// Fence lines are hidden; `in_code` carries code-block state across lines.
+fn markdown(text: &str, in_code: &mut bool, t: &Theme) -> Option<Line<'static>> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("```") {
+        *in_code = !*in_code;
+        return None;
+    }
+    if *in_code {
+        return Some(Line::styled(format!("  {text}"), Style::new().fg(t.info)));
+    }
+    let base = Style::new().fg(t.text);
+    if let Some(heading) = trimmed.strip_prefix('#') {
+        let heading = heading.trim_start_matches('#').trim();
+        return Some(Line::from(inline(heading, base.fg(t.accent).bold(), t)));
+    }
+    let indent = &text[..text.len() - trimmed.len()];
+    let mut spans = match trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")) {
+        Some(item) => {
+            let mut s = vec![Span::raw(format!("{indent}  ")), Span::styled("• ", Style::new().fg(t.accent))];
+            s.extend(inline(item, base, t));
+            s
+        }
+        None => inline(text, base, t),
+    };
+    if spans.is_empty() {
+        spans.push(Span::raw(""));
+    }
+    Some(Line::from(spans))
+}
+
+/// Split a line on `code` and **bold** markers into styled spans.
+fn inline(text: &str, base: Style, t: &Theme) -> Vec<Span<'static>> {
+    let (mut spans, mut cur, mut bold, mut code) = (vec![], String::new(), false, false);
+    let mut chars = text.chars().peekable();
+    let style = |bold: bool, code: bool| match (code, bold) {
+        (true, _) => Style::new().fg(t.info),
+        (false, true) => base.bold(),
+        _ => base,
+    };
+    while let Some(c) = chars.next() {
+        let toggle = if c == '`' {
+            Some(true)
+        } else if c == '*' && !code && chars.peek() == Some(&'*') {
+            chars.next();
+            Some(false)
+        } else {
+            None
+        };
+        match toggle {
+            Some(is_code) => {
+                if !cur.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut cur), style(bold, code)));
+                }
+                if is_code { code = !code } else { bold = !bold }
+            }
+            None => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        spans.push(Span::styled(cur, style(bold, code)));
+    }
+    spans
+}
+
+fn fmt_duration(d: Duration) -> String {
+    let s = d.as_secs();
+    if s < 60 { format!("{s}s") } else { format!("{}m {:02}s", s / 60, s % 60) }
+}
+
 /// Keep the end of a long path: "…/deep/folder".
 fn shorten(path: &str, max: usize) -> String {
     let n = path.chars().count();
@@ -381,11 +616,12 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App, rx: &mut UnboundedReceiver
             app.handle(msg);
         }
         terminal.draw(|f| app.draw(f))?;
-        if event::poll(Duration::from_millis(80))?
-            && let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-        {
-            app.key(k);
+        if event::poll(Duration::from_millis(80))? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => app.key(k),
+                Event::Paste(text) if app.picker.is_none() && app.viewer.is_none() => app.insert(&text),
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -402,10 +638,12 @@ fn main() -> std::io::Result<()> {
         manager: None,
         scroll_back: 0,
         input: String::new(),
+        cursor: 0,
         busy: false,
-        stop: Arc::default(),
+        job: None,
         toast: None,
         picker: None,
+        viewer: None,
         history: String::new(),
         theme: 0,
         cwd: if home.is_empty() { cwd.clone() } else { cwd.replacen(&home, "~", 1) },
@@ -415,7 +653,42 @@ fn main() -> std::io::Result<()> {
         quit: false,
     };
     let mut terminal = ratatui::init();
+    execute!(std::io::stdout(), EnableBracketedPaste)?;
     let result = run(&mut terminal, &mut app, &mut rx);
+    execute!(std::io::stdout(), DisableBracketedPaste)?;
     ratatui::restore();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn renders_markdown() {
+        let t = &THEMES[0];
+        let mut code = false;
+        let line = markdown("Use **bold** and `x = 1` here", &mut code, t).unwrap();
+        assert_eq!(text(&line), "Use bold and x = 1 here");
+        assert_eq!(line.spans[1].style, Style::new().fg(t.text).bold());
+        assert_eq!(line.spans[3].style, Style::new().fg(t.info));
+        assert_eq!(text(&markdown("## Plan", &mut code, t).unwrap()), "Plan");
+        assert_eq!(text(&markdown("  - item", &mut code, t).unwrap()), "    • item");
+        assert!(markdown("```rust", &mut code, t).is_none() && code);
+        assert_eq!(text(&markdown("let a = **b**;", &mut code, t).unwrap()), "  let a = **b**;", "no markup in code blocks");
+        assert!(markdown("```", &mut code, t).is_none() && !code);
+        assert_eq!(text(&markdown("2 * 3 = 6", &mut code, t).unwrap()), "2 * 3 = 6");
+    }
+
+    #[test]
+    fn formats_and_shortens() {
+        assert_eq!(fmt_duration(Duration::from_secs(42)), "42s");
+        assert_eq!(fmt_duration(Duration::from_secs(187)), "3m 07s");
+        assert_eq!(shorten("/a/b/c/deep", 6), "…/deep");
+        assert_eq!(shorten("/short", 20), "/short");
+    }
 }

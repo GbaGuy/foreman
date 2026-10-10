@@ -1,5 +1,7 @@
 # foreman
 
+[![CI](https://github.com/GbaGuy/foreman/actions/workflows/ci.yml/badge.svg)](https://github.com/GbaGuy/foreman/actions/workflows/ci.yml)
+
 A terminal UI, written in Rust, where you talk to one AI **manager** and it gets the work done with a team of AI **workers** that it creates as needed.
 
 - You only see and talk to the manager.
@@ -49,15 +51,17 @@ Run `foreman` in the folder you want the work done in.
 
 | Key | What it does |
 |---|---|
-| type + `Enter` | Talks to the manager |
+| type + `Enter` | Talks to the manager. Pasting multi-line text is safe: it won't send early |
+| `Tab` | Opens the workers' live output; `←`/`→` switch workers, `Esc` closes |
+| `Ctrl+S` | Stops the job right away and kills any running workers |
 | `Ctrl+O` | Picks the manager's Claude model (opus, sonnet, haiku) |
 | `Ctrl+W` | Picks the workers' opencode model, free models first |
-| `Ctrl+S` | Stops once the running workers finish |
-| `↑` `↓` / `PgUp` `PgDn` / `End` | Scrolls the chat; `End` jumps back to the bottom |
+| `↑` `↓` / `PgUp` `PgDn` / `Esc` | Scrolls the chat; `Esc` jumps back to the bottom |
+| `←` `→` / `Home` `End` | Moves the cursor in the message box |
 | `Ctrl+T` | Switches the colour theme (tokyo-night, catppuccin, gruvbox) |
 | `Ctrl+Q` | Quits |
 
-The workers strip shows each worker of the current job with its role and state (spinner while working, ● done, ✗ failed). Their raw output isn't shown; the manager reads it and reports to you.
+The workers strip shows each worker of the current job with its role, state (spinner while working, ● done, ✗ failed) and run time. The manager reads their output and reports to you; press `Tab` if you want to watch it yourself. Manager replies are shown with basic Markdown formatting.
 
 ## Configure
 
@@ -67,13 +71,17 @@ Settings live in `~/.config/foreman/crew.json`:
 {
   "max_rounds": 3,
   "manager": "claude -p --tools=Read,Grep,Glob {prompt}",
-  "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}"
+  "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}",
+  "max_parallel": 4,
+  "worker_timeout_mins": 20
 }
 ```
 
 - `manager` runs Claude with read-only tools, so it can look at the project to plan but can't edit files or run commands. Keep the `=` in `--tools=...`: without it the flag swallows the prompt.
 - `worker` is the command every worker runs. Workers need permission to act, which is what `--auto` gives opencode. You can use any agent CLI here, for example `claude -p --permission-mode acceptEdits {prompt}` or `codex exec {prompt}`.
 - `max_rounds` caps how many plan, work, review rounds one message can take.
+- `max_parallel` caps how many workers run at once; the rest wait their turn.
+- `worker_timeout_mins` kills a worker that runs longer than this.
 
 Commands run without a shell, and the prompt is passed as a single argument.
 

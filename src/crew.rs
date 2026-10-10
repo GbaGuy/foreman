@@ -7,10 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::task::JoinSet;
 
 /// The manager is Claude with read-only tools: it can look around but not do the work.
 /// (`--tools=` needs the "=": the flag takes several values and would swallow the prompt.)
@@ -33,10 +35,24 @@ pub struct Crew {
     pub max_rounds: u32,
     pub manager: String,
     pub worker: String,
+    /// How many workers may run at once.
+    #[serde(default = "default_parallel")]
+    pub max_parallel: usize,
+    /// A worker running longer than this is killed.
+    #[serde(default = "default_timeout")]
+    pub worker_timeout_mins: u64,
 }
 
 fn default_rounds() -> u32 {
     3
+}
+
+fn default_parallel() -> usize {
+    4
+}
+
+fn default_timeout() -> u64 {
+    20
 }
 
 impl Crew {
@@ -49,7 +65,13 @@ impl Crew {
         std::fs::read_to_string(Self::path())
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_else(|| Crew { max_rounds: 3, manager: MANAGER_COMMAND.into(), worker: WORKER_COMMAND.into() })
+            .unwrap_or_else(|| Crew {
+                max_rounds: default_rounds(),
+                manager: MANAGER_COMMAND.into(),
+                worker: WORKER_COMMAND.into(),
+                max_parallel: default_parallel(),
+                worker_timeout_mins: default_timeout(),
+            })
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -91,6 +113,7 @@ pub enum Msg {
     Log(Kind, String),
     Manager(State),
     Worker(String, String, State), // name, role, state
+    Output(String, String),        // a worker's output line: name, line
     Notify(String),
     /// A user/manager exchange to keep as conversation history.
     Remember(String),
@@ -229,8 +252,9 @@ pub fn opencode_models() -> Result<Vec<(String, &'static str)>, String> {
     if models.is_empty() { Err("opencode listed no models".into()) } else { Ok(models) }
 }
 
-/// Run a CLI agent to completion; return (ok, all output with escapes stripped).
-pub async fn run_command(command: &str, prompt: &str) -> (bool, String) {
+/// Run a CLI agent to completion, handing each output line to `on_line`;
+/// return (ok, all output with escapes stripped).
+pub async fn run_command(command: &str, prompt: &str, on_line: impl Fn(&str)) -> (bool, String) {
     let Some(argv) = build_argv(command, prompt) else {
         return (false, format!("bad command: {command}"));
     };
@@ -250,7 +274,9 @@ pub async fn run_command(command: &str, prompt: &str) -> (bool, String) {
     let mut reader = BufReader::new(child.stdout.take().unwrap());
     let mut buf = Vec::new();
     while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-        out.push_str(&strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    "));
+        let line = strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    ");
+        on_line(&line);
+        out.push_str(&line);
         out.push('\n');
         buf.clear();
     }
@@ -262,14 +288,14 @@ pub async fn run_command(command: &str, prompt: &str) -> (bool, String) {
 }
 
 /// Run one round step by step; append this round's output to the report.
-async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, tx: &UnboundedSender<Msg>, stop: &AtomicBool) {
+/// Dropping this future (when the user stops the job) aborts the workers, which kills their processes.
+async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, tx: &UnboundedSender<Msg>) {
     let mut steps: Vec<i64> = plan.iter().map(|t| t.step).collect();
     steps.sort();
     steps.dedup();
+    let slots = Arc::new(Semaphore::new(crew.max_parallel.max(1)));
+    let timeout = Duration::from_secs(crew.worker_timeout_mins.max(1) * 60);
     for step in steps {
-        if stop.load(Ordering::Relaxed) {
-            return;
-        }
         let batch: Vec<&Task> = plan.iter().filter(|t| t.step == step).collect();
         // ponytail: only the last 12k chars of history go to workers; summarise rounds if that loses context
         let earlier = if report.trim().is_empty() {
@@ -277,29 +303,34 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
         } else {
             format!("\n\nWork done so far by the team:\n{}", tail(report, 12_000))
         };
-        let handles: Vec<_> = batch
-            .iter()
-            .map(|t| {
-                let prompt = format!(
-                    "You are {}, a worker on an AI team.\nYour role: {}\nTeam goal: {goal}\n\nYour task: {}{earlier}",
-                    t.worker, t.role, t.task
-                );
-                let (command, tx, t) = (crew.worker.clone(), tx.clone(), (*t).clone());
-                tokio::spawn(async move {
-                    tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), State::Working)).ok();
-                    let (ok, out) = run_command(&command, &prompt).await;
-                    tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), if ok { State::Done } else { State::Failed })).ok();
-                    if ok {
-                        tx.send(Msg::Log(Kind::Good, format!("● {} finished", t.worker))).ok();
-                    } else {
-                        tx.send(Msg::Log(Kind::Bad, format!("✗ {} failed: {}", t.worker, last_line(&out)))).ok();
-                    }
-                    out
-                })
-            })
-            .collect();
-        for (t, h) in batch.iter().zip(handles) {
-            let out = h.await.unwrap_or_default();
+        let mut set = JoinSet::new();
+        for (i, t) in batch.iter().enumerate() {
+            let prompt = format!(
+                "You are {}, a worker on an AI team.\nYour role: {}\nTeam goal: {goal}\n\nYour task: {}{earlier}",
+                t.worker, t.role, t.task
+            );
+            let (command, tx, t, slots) = (crew.worker.clone(), tx.clone(), (*t).clone(), slots.clone());
+            set.spawn(async move {
+                let _slot = slots.acquire_owned().await;
+                tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), State::Working)).ok();
+                let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
+                let (ok, out) = tokio::time::timeout(timeout, run_command(&command, &prompt, echo))
+                    .await
+                    .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60)));
+                tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), if ok { State::Done } else { State::Failed })).ok();
+                if ok {
+                    tx.send(Msg::Log(Kind::Good, format!("● {} finished", t.worker))).ok();
+                } else {
+                    tx.send(Msg::Log(Kind::Bad, format!("✗ {} failed: {}", t.worker, last_line(&out)))).ok();
+                }
+                (i, out)
+            });
+        }
+        let mut outs = vec![String::new(); batch.len()];
+        while let Some(Ok((i, out))) = set.join_next().await {
+            outs[i] = out;
+        }
+        for (t, out) in batch.iter().zip(outs) {
             report.push_str(&format!("\n## {} ({})\n{}\n", t.worker, t.role, tail(&out, 6_000)));
         }
     }
@@ -308,7 +339,7 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
 /// Ask the manager; show its prose to the user and return (ok, prose, plan).
 async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (bool, String, Vec<Task>) {
     tx.send(Msg::Manager(State::Working)).ok();
-    let (ok, reply) = run_command(&crew.manager, prompt).await;
+    let (ok, reply) = run_command(&crew.manager, prompt, |_| ()).await;
     tx.send(Msg::Manager(if ok { State::Done } else { State::Failed })).ok();
     if !ok {
         tx.send(Msg::Log(Kind::Bad, format!("The manager failed: {}", last_line(&reply)))).ok();
@@ -322,7 +353,7 @@ async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (b
 }
 
 /// Plan, run the workers, review, and re-plan until the manager is satisfied or rounds run out.
-pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: UnboundedSender<Msg>, stop: Arc<AtomicBool>) {
+pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: UnboundedSender<Msg>) {
     let log = |kind, text: String| tx.send(Msg::Log(kind, text)).ok();
     let (ok, prose, mut plan) = ask_manager(&crew, &manager_prompt(&goal, &history), &tx).await;
     if ok && plan.is_empty() {
@@ -336,11 +367,7 @@ pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: Unbounde
             log(Kind::Info, format!("  step {} · {} ({}): {}", t.step, t.worker, t.role, t.task));
         }
         report.push_str(&format!("\n# Round {round}\n"));
-        run_plan(&crew, &goal, &plan, &mut report, &tx, &stop).await;
-        if stop.load(Ordering::Relaxed) {
-            log(Kind::Warn, format!("Stopped during round {round}."));
-            break;
-        }
+        run_plan(&crew, &goal, &plan, &mut report, &tx).await;
         let last = round >= crew.max_rounds;
         let (ok, summary, next) = ask_manager(&crew, &review_prompt(&goal, tail(&report, 24_000), last), &tx).await;
         plan = if last || !ok { vec![] } else { next };
@@ -420,9 +447,11 @@ mod tests {
             max_rounds,
             manager: format!("sh -c {} sh {{prompt}}", shlex::try_quote(script).unwrap()),
             worker: "echo DID {prompt}".into(),
+            max_parallel: 4,
+            worker_timeout_mins: 1,
         };
         let (tx, mut rx) = unbounded_channel();
-        orchestrate(crew, goal.into(), "User: earlier\nManager: ok".into(), tx, Arc::default()).await;
+        orchestrate(crew, goal.into(), "User: earlier\nManager: ok".into(), tx).await;
         let mut msgs = vec![];
         while let Ok(m) = rx.try_recv() {
             msgs.push(m);
@@ -458,8 +487,52 @@ mod tests {
         assert!(chat.contains("Done after 2 round(s)"));
         let w = workers(&msgs);
         assert!(w.contains(&("coder", State::Done)) && w.contains(&("checker", State::Done)));
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Output(n, l) if n == "coder" && l.starts_with("DID"))));
         assert!(matches!(msgs.last(), Some(Msg::Finished)));
         assert!(msgs.iter().any(|m| matches!(m, Msg::Remember(r) if r.contains("ALL DONE"))));
+    }
+
+    /// Three 0.3s workers with one slot must take about 0.9s; with three slots about 0.3s.
+    #[tokio::test]
+    async fn caps_parallel_workers() {
+        let plan: Vec<Task> = ["a", "b", "c"]
+            .iter()
+            .map(|n| Task { worker: n.to_string(), role: String::new(), task: "t".into(), step: 1 })
+            .collect();
+        for (slots, min_ms, max_ms) in [(1, 850, 2_000), (3, 250, 800)] {
+            let crew = Crew {
+                max_rounds: 1,
+                manager: String::new(),
+                worker: "sh -c 'sleep 0.3' sh {prompt}".into(),
+                max_parallel: slots,
+                worker_timeout_mins: 1,
+            };
+            let (tx, _rx) = unbounded_channel();
+            let start = std::time::Instant::now();
+            run_plan(&crew, "g", &plan, &mut String::new(), &tx).await;
+            let ms = start.elapsed().as_millis();
+            assert!((min_ms..max_ms).contains(&ms), "{slots} slot(s) took {ms}ms");
+        }
+    }
+
+    /// Aborting a job (Ctrl+S) must kill its workers before they finish.
+    #[tokio::test]
+    async fn abort_kills_workers() {
+        let marker = std::env::temp_dir().join(format!("foreman-abort-{}", std::process::id()));
+        let crew = Crew {
+            max_rounds: 1,
+            manager: String::new(),
+            worker: format!("sh -c 'sleep 0.6; touch {}' sh {{prompt}}", marker.display()),
+            max_parallel: 4,
+            worker_timeout_mins: 1,
+        };
+        let plan = vec![Task { worker: "w".into(), role: String::new(), task: "t".into(), step: 1 }];
+        let (tx, _rx) = unbounded_channel();
+        let job = tokio::spawn(async move { run_plan(&crew, "g", &plan, &mut String::new(), &tx).await });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        job.abort();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(!marker.exists(), "worker kept running after abort");
     }
 
     #[tokio::test]
