@@ -352,10 +352,9 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
                     .await
                     .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60)));
                 tx.send(Msg::Worker(t.worker.clone(), if ok { State::Done } else { State::Failed })).ok();
-                if ok {
-                    tx.send(Msg::Log(Kind::Good, format!("● {} finished", t.worker))).ok();
-                } else {
-                    tx.send(Msg::Log(Kind::Bad, format!("✗ {} failed: {}", t.worker, last_line(&out)))).ok();
+                // success shows in the round's to-do list; a failure also gets a line saying why
+                if !ok {
+                    tx.send(Msg::Log(Kind::Bad, format!("{} failed: {}", t.worker, last_line(&out)))).ok();
                 }
                 (i, out)
             });
@@ -466,7 +465,7 @@ pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: Unbounde
         let (ok, summary, next) = ask_manager(&crew, &review_prompt(&goal, tail(&report, 24_000), last), &tx).await;
         plan = if last || !ok { vec![] } else { next };
         if plan.is_empty() {
-            log(Kind::Good, format!("Done after {round} round(s)."));
+            log(Kind::Good, format!("Done after {round} round{}", if round == 1 { "" } else { "s" }));
             tx.send(Msg::Remember(format!("User: {goal}\nManager (after {round} round(s) of work): {}", tail(&summary, 1_500)))).ok();
             tx.send(Msg::Notify("Crew finished".into())).ok();
         }
@@ -640,7 +639,7 @@ mod tests {
         let chat = chat(&msgs);
         assert!(chat.contains("On it.") && !chat.contains("\"worker\""), "prose shown, JSON hidden");
         assert!(chat.contains("ALL DONE"), "round 2 saw round 1: {chat}");
-        assert!(chat.contains("Done after 2 round(s)"));
+        assert!(chat.contains("Done after 2 rounds"));
         let w = workers(&msgs);
         assert!(w.contains(&("coder", State::Done)) && w.contains(&("checker", State::Done)));
         assert!(msgs.iter().any(|m| matches!(m, Msg::Output(n, l) if n == "coder" && l.starts_with("DID"))));
@@ -697,7 +696,7 @@ mod tests {
     async fn stops_at_round_cap() {
         let msgs = run_crew(1, "ship it").await;
         assert!(!workers(&msgs).iter().any(|(n, _)| *n == "checker"));
-        assert!(chat(&msgs).contains("Done after 1 round(s)"));
+        assert!(chat(&msgs).contains("Done after 1 round"));
     }
 
     #[tokio::test]

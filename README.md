@@ -11,28 +11,29 @@ A terminal UI, written in Rust, where you talk to one AI **manager** and it gets
 - For a question or chat that needs no work, it just answers. It remembers the conversation.
 
 ```
- ⚒ foreman   ★ Manager  ▦ Workers 2  │ ◑ builder  ○ tester                                ◑ working
- ~/projects/calc                         manager claude sonnet · workers nemotron-3.5-lightning-free
-╭ ◑ builder · Python developer ────────────── 2s ╮╭ ○ tester · QA ─────────────── waits for step 2 ╮
-│ > build · nemotron-3.5-lightning-free          ││ queued: starts when the earlier steps finish   │
-│ Thinking: I should read notes.md first.        ││                                                │
-│ → Read notes.md                                ││                                                │
-│ ← Write calc.py                                ││                                                │
-│ Created file successfully: calc.py             ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-│                                                ││                                                │
-╰────────────────────────────────────────────────╯╰────────────────────────────────────────────────╯
-╭ ❯ to manager ────────────────────────────────────────────────────────────────────────────────────╮
-│The manager is working… (Ctrl+S stops it)                                                         │
-╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- Tab next tab  ^S stop  ^O manager model  ^W worker model  ^T theme  ^Q quit
+ ✻ foreman   Manager  ·  Workers 2  │  ⏺ builder  ·  ⏺ tester   ~/projects/calc
+
+ > build a calculator with tests
+
+ ⏺ Read(notes.md)
+
+ ⏺ Round 1 · 2 workers
+   ⎿  ☒ builder · Python developer
+        Create calc.py with add, sub, mul and div
+      ☒ tester · QA
+        Write and run tests for calc.py
+
+ ⏺ Read(calc.py)
+
+ ⏺ The goal is met. calc.py has add, sub, mul and div, and the tester ran 5 tests:
+     • all 5 pass
+     • dividing by zero raises ZeroDivisionError
+   ⎿  Done after 1 round
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────╮
+│ > Try "build a todo app in todo.py, with tests"                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+  tab to switch view · ↑↓ to scroll · ctrl+o/w models   claude sonnet · workers nemotron-3.5-lightning-free
 ```
 
 ## Install
@@ -57,10 +58,10 @@ Run `foreman` in the folder you want the work done in.
 | `Ctrl+W` | Picks the workers' opencode model, free models first |
 | `↑` `↓` / `PgUp` `PgDn` / `Esc` | Scrolls the current tab; `Esc` jumps back to the bottom |
 | `←` `→` / `Home` `End` | Moves the cursor in the message box |
-| `Ctrl+T` | Switches the colour theme (tokyo-night, catppuccin, gruvbox) |
+| `Ctrl+T` | Switches the colour theme (claude, tokyo-night, catppuccin) |
 | `Ctrl+Q` | Quits |
 
-foreman is tab based. **★ Manager** is your chat: your messages (❯), the manager's replies, a divider per round, and each task it hands out with its step, worker and role. **▦ Workers** shows every worker live in a grid (up to six panes), and each worker also gets its own tab with its task on top and its full output below. Workers show their state (○ queued, spinner while working, ● done, ✗ failed) and run time, and their output is coloured: reasoning dimmed, tool actions highlighted, errors in red. You can type to the manager from any tab.
+The look follows Claude Code: a flowing transcript with `>` for your messages, `⏺` for the manager's replies and the files it reads (`⏺ Read(notes.md)`), each round as a to-do list (☐ queued, ◼ working, ☒ done, ✗ failed), and an orange `✻ Planning… (12s · ctrl+s to stop)` spinner above a plain prompt box. Tabs switch between the **Manager** transcript, a **Workers** overview (every worker live, up to six panes) and one tab per worker with its task and full output. Worker output is shown the same way: reasoning as `✻`, actions as `⏺ Write(calc.py)`, errors in red. You can type to the manager from any tab, and `ctrl+t` cycles colour themes (claude, tokyo-night, catppuccin).
 
 The manager streams too: `💭 thinking (~N tokens)`, each file it reads or searches (`→ Read notes.md`), then its reply as it's written. Claude Code doesn't hand out the text of Claude's thinking, only that it's thinking and roughly how much; the workers' opencode models do show their full reasoning. Manager replies are shown with basic Markdown formatting.
 
