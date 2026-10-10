@@ -62,6 +62,7 @@ Run `foreman` in the folder you want the work done in.
 | `↑` `↓` / `PgUp` `PgDn` / `Esc` | Scrolls the current tab; `Esc` jumps back to the bottom |
 | `←` `→` / `Home` `End` | Moves the cursor in the message box |
 | `Ctrl+T` | Switches the colour theme (claude, tokyo-night, catppuccin) |
+| `Ctrl+N` | Starts a new chat: clears this folder's saved chat and the manager's memory of it |
 | `Ctrl+Q` | Quits |
 
 The main view is a **team chat** in WhatsApp's style: your messages in green bubbles on the right, the manager's and workers' on the left with the sender's name and the time, and rounds and file changes as centred notes. The messages are `you → manager`, `manager → builder` (the orders, the files it owns, and live status: queued, working 12s, done, failed, with tokens used), `builder → manager` (the worker's report), and `manager → you` (the summary). Each worker has its own colour, and foreman notes which files each step changed. An orange `✻ builder, tester working… (40s · ctrl+s to stop)` spinner sits above a plain `>` prompt box.
@@ -89,6 +90,8 @@ Settings live in `~/.config/foreman/crew.json`:
 - `manager` runs Claude with read-only tools, so it can look at the project to plan and check work but can't edit files or run commands. `--output-format json` is how foreman reads its token usage.
 - `worker` is the command every worker runs. Workers need permission to act (edit files, run shell commands), which is what `--auto` gives opencode; `--standalone` gives each worker its own opencode server, so stopping a worker really stops it; `--format json` lets foreman show each action and count tokens. Any other agent CLI works too (its output is shown as plain text, without token counts), for example `claude -p --permission-mode acceptEdits {prompt}` or `codex exec {prompt}`.
 - When workers run opencode, the manager picks each worker's model from opencode's free models to suit its task (it falls back to the `worker` model).
+- The manager sees each free model's record (how many of its workers finished, failed or were stopped, and their average tokens), kept in `~/.local/state/foreman/models.json`, so it learns which models to trust.
+- The chat is saved per folder in `~/.local/state/foreman/chats/` and comes back when you start foreman there again.
 - `max_rounds` caps how many plan, work, review rounds one message can take.
 - With opencode, foreman enforces file ownership: each worker's file tools may only edit the files the manager gave it (an `OPENCODE_CONFIG_CONTENT` edit permission). The shell isn't covered, so foreman's record of changed files still flags anything else.
 - `max_parallel` caps how many workers run at once; the rest wait their turn.

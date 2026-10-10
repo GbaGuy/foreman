@@ -22,7 +22,9 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Cell as TableCell, Clear, List, ListItem, ListState, Padding, Paragraph, Row, Table, Wrap};
 use ratatui::{DefaultTerminal, Frame};
+use serde::{Deserialize, Serialize};
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio::task::JoinHandle;
@@ -77,6 +79,7 @@ enum Click {
     Models(bool), // true = the manager's
     Theme,
     Quit,
+    NewChat,
     Send,
     Pick(usize), // a row of the model picker
     Picker,      // anywhere else inside the picker
@@ -91,6 +94,7 @@ struct Picker {
 }
 
 /// One message or note in the team chat.
+#[derive(Serialize, Deserialize)]
 enum Entry {
     Line(Kind, String),
     /// The manager's orders to a worker, with that worker's latest state (None = queued).
@@ -102,6 +106,31 @@ enum Entry {
         to: String,
         text: String,
     },
+}
+
+/// The chat as saved per project folder, so it survives a restart.
+#[derive(Serialize, Deserialize, Default)]
+struct Saved {
+    chat: Vec<Entry>,
+    times: Vec<String>,
+    history: String, // what the manager remembers of the conversation
+}
+
+/// Where the chat for `cwd` is saved: one file per folder in foreman's state folder.
+fn chat_file(cwd: &str) -> PathBuf {
+    crew::state_dir().join("chats").join(format!("{}.json", cwd.trim_start_matches('/').replace('/', "%")))
+}
+
+fn load_chat(path: &PathBuf) -> Saved {
+    let mut saved: Saved = std::fs::read_to_string(path).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // a job cut off by quitting never finished
+    for entry in &mut saved.chat {
+        if let Entry::Task(_, s @ (None | Some(State::Working))) = entry {
+            *s = Some(State::Failed);
+        }
+    }
+    saved.times.resize(saved.chat.len(), String::new());
+    saved
 }
 
 /// One worker of the current job, as the UI tracks it.
@@ -144,6 +173,7 @@ struct App {
     toast: Option<(String, Instant)>,
     picker: Option<Picker>,
     history: String, // past user/manager exchanges, fed back to the manager
+    chat_file: PathBuf,
     theme: usize,
     cwd: String,
     started: Instant,
@@ -253,7 +283,10 @@ impl App {
                 let cut = (cut..self.history.len()).find(|&i| self.history.is_char_boundary(i)).unwrap_or(0);
                 self.history.drain(..cut);
             }
-            Msg::Finished => (self.busy, self.job) = (false, None),
+            Msg::Finished => {
+                (self.busy, self.job) = (false, None);
+                self.save_chat();
+            }
         }
     }
 
@@ -275,6 +308,7 @@ impl App {
                 self.toast(format!("theme: {}", self.t().name));
             }
             KeyCode::Char('u') if ctrl => (self.input, self.cursor) = (String::new(), 0),
+            KeyCode::Char('n') if ctrl => self.new_chat(),
             KeyCode::Char('a') if ctrl => self.cursor = 0,
             KeyCode::Char('e') if ctrl => self.cursor = len,
             KeyCode::Tab => self.tab = (self.tab + 1) % tabs,
@@ -337,6 +371,7 @@ impl App {
                     self.toast(format!("theme: {}", self.t().name));
                 }
                 Some(Click::Quit) => self.quit = true,
+                Some(Click::NewChat) => self.new_chat(),
                 Some(Click::Send) => self.submit(),
                 _ => {}
             },
@@ -388,6 +423,30 @@ impl App {
             }
         }
         self.post(Entry::Line(Kind::Warn, "Interrupted by you. Running workers were stopped.".into()));
+        self.save_chat();
+    }
+
+    /// Save the chat (the last 500 entries) and the manager's memory for this folder.
+    fn save_chat(&mut self) {
+        let skip = self.chat.len().saturating_sub(500);
+        let saved = serde_json::json!({ "chat": &self.chat[skip..], "times": &self.times[skip.min(self.times.len())..], "history": self.history });
+        if let Some(dir) = self.chat_file.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        if let Err(e) = std::fs::write(&self.chat_file, saved.to_string()) {
+            self.toast(format!("Could not save the chat: {e}"));
+        }
+    }
+
+    /// Forget this folder's chat and the manager's memory of it.
+    fn new_chat(&mut self) {
+        if self.busy {
+            return self.toast("Stop the job first");
+        }
+        (self.chat, self.times, self.history, self.workers) = (vec![], vec![], String::new(), vec![]);
+        (self.tab, self.scroll_back) = (MANAGER_TAB, 0);
+        self.save_chat();
+        self.toast("New chat: the manager starts fresh");
     }
 
     fn open_picker(&mut self, for_manager: bool) {
@@ -553,6 +612,7 @@ impl App {
         let (text, color) = match state {
             None => (format!("○ queued for step {}", task.step), t.dim),
             Some(State::Working) => (format!("◼ working {time}{tokens}"), t.warn),
+            Some(State::Done) if time.is_empty() => (format!("✓ done{tokens}"), t.good),
             Some(State::Done) => (format!("✓ done in {time}{tokens}"), t.good),
             Some(State::Failed) => (format!("✗ failed{tokens}"), t.bad),
         };
@@ -779,6 +839,7 @@ impl App {
         if self.busy {
             buttons.insert(0, ("Stop", "^S", Click::Stop));
         }
+        buttons.push(("New chat", "^N", Click::NewChat));
         buttons.push(("Quit", "^Q", Click::Quit));
         let mut spans = vec![];
         let mut x = area.x;
@@ -1301,10 +1362,12 @@ fn main() -> std::io::Result<()> {
     let (tx, mut rx) = unbounded_channel();
     let home = std::env::var("HOME").unwrap_or_default();
     let cwd = std::env::current_dir()?.display().to_string();
+    let chat_file = chat_file(&cwd);
+    let saved = load_chat(&chat_file);
     let mut app = App {
         crew: Crew::load(),
-        chat: Vec::new(),
-        times: Vec::new(),
+        chat: saved.chat,
+        times: saved.times,
         tz: local_offset(),
         hits: RefCell::new(Vec::new()),
         workers: Vec::new(),
@@ -1319,7 +1382,8 @@ fn main() -> std::io::Result<()> {
         job_started: Instant::now(),
         toast: None,
         picker: None,
-        history: String::new(),
+        history: saved.history,
+        chat_file,
         theme: 0,
         cwd: if home.is_empty() { cwd.clone() } else { cwd.replacen(&home, "~", 1) },
         started: Instant::now(),
@@ -1328,10 +1392,17 @@ fn main() -> std::io::Result<()> {
         quit: false,
     };
     let mut terminal = ratatui::init();
+    // ratatui's hook restores the screen on a panic; also give the mouse and paste back to the terminal
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture).ok();
+        restore(info);
+    }));
     execute!(std::io::stdout(), EnableBracketedPaste, EnableMouseCapture)?;
     let result = run(&mut terminal, &mut app, &mut rx);
     execute!(std::io::stdout(), DisableBracketedPaste, DisableMouseCapture)?;
     ratatui::restore();
+    app.save_chat();
     result
 }
 
@@ -1383,6 +1454,22 @@ mod tests {
         assert_eq!(reply_start(&["→ Read x".to_string()]), 1);
         let failed: Vec<String> = ["⚙ Write a.py", "Error: no tool named finish", "All done."].iter().map(|s| s.to_string()).collect();
         assert_eq!(failed[reply_start(&failed)..], ["All done."]);
+    }
+
+    /// The chat survives a restart; a job cut off by quitting comes back as failed, not working.
+    #[test]
+    fn saves_and_loads_the_chat() {
+        let path = std::env::temp_dir().join(format!("foreman-chat-{}.json", std::process::id()));
+        let task = Task { worker: "w".into(), role: "r".into(), task: "t".into(), files: vec![], step: 1, model: String::new() };
+        let chat = vec![Entry::Line(Kind::User, "hi".into()), Entry::Task(task, Some(State::Working))];
+        std::fs::write(&path, serde_json::json!({ "chat": chat, "times": ["10:00"], "history": "User: hi" }).to_string()).unwrap();
+        let saved = load_chat(&path);
+        std::fs::remove_file(&path).ok();
+        assert!(matches!(&saved.chat[0], Entry::Line(Kind::User, t) if t == "hi"));
+        assert!(matches!(&saved.chat[1], Entry::Task(_, Some(State::Failed))));
+        assert_eq!((saved.times, saved.history.as_str()), (vec!["10:00".to_string(), String::new()], "User: hi"));
+        assert!(load_chat(&path).chat.is_empty(), "no file, empty chat");
+        assert_eq!(chat_file("/home/me/proj").file_name().unwrap(), "home%me%proj.json");
     }
 
     #[test]
