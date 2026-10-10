@@ -113,8 +113,8 @@ pub enum State {
 pub enum Kind {
     User,
     Think, // the manager's live activity: files it reads, searches it runs
+    Rule,  // a section divider, e.g. "Round 1 · 2 workers"
     Out,
-    Info,
     Good,
     Warn,
     Bad,
@@ -126,7 +126,8 @@ pub enum Msg {
     Manager(State),
     Thinking(u64),       // the manager is thinking; roughly this many more tokens
     ManagerText(String), // a chunk of the manager's reply as it's written
-    Worker(String, String, State), // name, role, state
+    Assign(Task),                  // the manager handed out a task (the worker is queued)
+    Worker(String, State),         // name, state
     Output(String, String),        // a worker's output line: name, line
     Notify(String),
     /// A user/manager exchange to keep as conversation history.
@@ -345,12 +346,12 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
             let (command, tx, t, slots) = (crew.worker.clone(), tx.clone(), (*t).clone(), slots.clone());
             set.spawn(async move {
                 let _slot = slots.acquire_owned().await;
-                tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), State::Working)).ok();
+                tx.send(Msg::Worker(t.worker.clone(), State::Working)).ok();
                 let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
                 let (ok, out) = tokio::time::timeout(timeout, run_command(&command, &prompt, idle, echo))
                     .await
                     .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60)));
-                tx.send(Msg::Worker(t.worker.clone(), t.role.clone(), if ok { State::Done } else { State::Failed })).ok();
+                tx.send(Msg::Worker(t.worker.clone(), if ok { State::Done } else { State::Failed })).ok();
                 if ok {
                     tx.send(Msg::Log(Kind::Good, format!("● {} finished", t.worker))).ok();
                 } else {
@@ -454,9 +455,10 @@ pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: Unbounde
     let mut report = String::new();
     let mut round = 1;
     while !plan.is_empty() {
-        log(Kind::Info, format!("Round {round}: {} worker(s)", plan.len()));
+        let n = plan.len();
+        log(Kind::Rule, format!("Round {round} · {n} worker{}", if n == 1 { "" } else { "s" }));
         for t in &plan {
-            log(Kind::Info, format!("  step {} · {} ({}): {}", t.step, t.worker, t.role, t.task));
+            tx.send(Msg::Assign(t.clone())).ok();
         }
         report.push_str(&format!("\n# Round {round}\n"));
         run_plan(&crew, &goal, &plan, &mut report, &tx).await;
@@ -626,7 +628,7 @@ mod tests {
     fn workers(msgs: &[Msg]) -> Vec<(&str, State)> {
         msgs.iter()
             .filter_map(|m| match m {
-                Msg::Worker(n, _, s) => Some((n.as_str(), *s)),
+                Msg::Worker(n, s) => Some((n.as_str(), *s)),
                 _ => None,
             })
             .collect()
