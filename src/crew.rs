@@ -12,8 +12,10 @@ use tokio::sync::mpsc::UnboundedSender;
 pub const BACKENDS: [(&str, &str); 3] = [
     ("claude", "claude -p {prompt}"),
     ("codex", "codex exec {prompt}"),
-    ("opencode", "opencode run {prompt}"),
+    ("opencode", "opencode run -m opencode/nemotron-3.5-lightning-free {prompt}"),
 ];
+/// The manager runs opencode's read-only "plan" agent: it can look around but not do the work.
+pub const MANAGER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --agent plan {prompt}";
 const PLAN_FORMAT: &str = r#"[{"worker": "<name>", "role": "<role>", "task": "<task>", "step": 1}]"#;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -52,9 +54,11 @@ impl Crew {
                     command: BACKENDS[0].1.into(),
                     role: role.into(),
                 };
+                let mut manager = agent("manager", "Engineering lead");
+                manager.command = MANAGER_COMMAND.into();
                 Crew {
                     max_rounds: 3,
-                    manager: agent("manager", "Engineering lead"),
+                    manager,
                     workers: vec![
                         agent("coder", "Writes and edits code"),
                         agent("reviewer", "Reviews work for bugs and gaps"),
@@ -99,6 +103,8 @@ pub enum Msg {
     State(String, State),
     Role(String, String),
     Notify(String),
+    /// A user/manager exchange to keep as conversation history.
+    Remember(String),
     Finished,
 }
 
@@ -124,17 +130,24 @@ pub fn build_argv(command: &str, prompt: &str) -> Option<Vec<String>> {
     (!argv.is_empty()).then_some(argv)
 }
 
-pub fn manager_prompt(goal: &str, workers: &[Agent]) -> String {
+pub fn manager_prompt(message: &str, workers: &[Agent], history: &str) -> String {
     let crew: Vec<String> = workers
         .iter()
         .map(|w| format!("- {}: {}", w.name, if w.role.is_empty() { "general agent" } else { &w.role }))
         .collect();
+    let crew = if crew.is_empty() { "(none)".to_string() } else { crew.join("\n") };
+    let history = if history.is_empty() { String::new() } else { format!("Conversation so far:\n{history}\n\n") };
     format!(
-        "You manage a team of AI agents working in the current directory.\nGoal: {goal}\n\nWorkers:\n{}\n\n\
-         Pick the workers you need, give each a specific role for this goal and a concrete task. \
-         Tasks with the same step run in parallel; a later step sees the output of earlier steps \
-         (e.g. review after writing). Reply with ONLY a JSON array, no prose:\n{PLAN_FORMAT}",
-        crew.join("\n")
+        "You are the manager of a team of AI agents working in the current directory. You do not do \
+         the work yourself and you do not use tools to write, edit or run anything: you break the \
+         work down and command your workers.\n\n{history}\
+         The user says: {message}\n\nYour workers:\n{crew}\n\n\
+         If this needs any work done (code, files, research, writing, checking), reply with ONLY a JSON \
+         array assigning it, no prose. Give each worker a specific role and a concrete task. Tasks with \
+         the same step run in parallel; a later step sees the output of earlier steps, so anything that \
+         checks work (review, testing) must have a higher step than the work it checks:\n{PLAN_FORMAT}\n\n\
+         Only if it is a quick question or chat that needs no work, or no worker can do it, answer it \
+         yourself in plain text with no JSON."
     )
 }
 
@@ -147,7 +160,8 @@ pub fn review_prompt(goal: &str, report: &str, last_round: bool) -> String {
              a JSON array assigning the next round of work, in this format:\n{PLAN_FORMAT}"
         )
     };
-    format!("Goal: {goal}\n\nYour workers reported:\n{report}\n\nReview their work: what got done and what is missing. {ask}")
+    format!("Goal: {goal}\n\nYour workers reported:\n{report}\n\nReview their work: what got done and what is missing. \
+              Do not do missing work yourself; assign it. {ask}")
 }
 
 /// Pull the JSON array ending the manager's reply; keep known workers, default step 1.
@@ -179,12 +193,51 @@ fn tail(s: &str, max: usize) -> &str {
     &s[i..]
 }
 
+/// Drop terminal escape sequences (colours, cursor moves) that CLIs print.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // CSI: ESC [ params final-byte; anything else: drop ESC and the next char
+            if chars.next() == Some('[') {
+                for c in chars.by_ref() {
+                    if ('@'..='~').contains(&c) {
+                        break;
+                    }
+                }
+            }
+        } else if !c.is_control() {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// List opencode's models with a tag: "free" (opencode's free cloud models), "local", or "".
+pub fn opencode_models() -> Result<Vec<(String, &'static str)>, String> {
+    let out = std::process::Command::new("opencode").arg("models").output().map_err(|e| format!("opencode: {e}"))?;
+    let mut models: Vec<(String, &'static str)> = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| strip_ansi(l).trim().to_string())
+        .filter(|l| l.contains('/'))
+        .map(|l| {
+            let tag = if l.ends_with("-free") { "free" } else if l.starts_with("local-") { "local" } else { "" };
+            (l, tag)
+        })
+        .collect();
+    models.sort_by_key(|(_, tag)| ["free", "local", ""].iter().position(|t| t == tag));
+    if models.is_empty() { Err("opencode listed no models".into()) } else { Ok(models) }
+}
+
 /// Run one agent's CLI, stream its output as Log messages, return (ok, all output).
 pub async fn run_agent(agent: Agent, prompt: String, tx: UnboundedSender<Msg>) -> (bool, String) {
     let name = agent.name.clone();
     let log = |kind, text: String| tx.send(Msg::Log(name.clone(), kind, text)).ok();
     tx.send(Msg::State(name.clone(), State::Working)).ok();
-    log(Kind::Prompt, format!("▶ {}", prompt.lines().next().unwrap_or_default().chars().take(200).collect::<String>()));
+    let first = prompt.lines().next().unwrap_or_default();
+    let short: String = first.chars().take(120).collect();
+    log(Kind::Prompt, format!("▶ {short}{}", if short.len() < first.len() { "…" } else { "" }));
 
     let Some(argv) = build_argv(&agent.command, &prompt) else {
         log(Kind::Bad, format!("bad command: {}", agent.command));
@@ -209,7 +262,7 @@ pub async fn run_agent(agent: Agent, prompt: String, tx: UnboundedSender<Msg>) -
             let mut reader = BufReader::new(child.stdout.take().unwrap());
             let mut buf = Vec::new();
             while reader.read_until(b'\n', &mut buf).await.unwrap_or(0) > 0 {
-                let line = String::from_utf8_lossy(&buf).trim_end().replace('\t', "    ");
+                let line = strip_ansi(String::from_utf8_lossy(&buf).trim_end()).replace('\t', "    ");
                 out.push_str(&line);
                 out.push('\n');
                 log(Kind::Out, line);
@@ -263,15 +316,16 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
 }
 
 /// Plan, run the workers, review, and re-plan until the manager is satisfied or rounds run out.
-pub async fn orchestrate(crew: Crew, goal: String, tx: UnboundedSender<Msg>, stop: Arc<AtomicBool>) {
+pub async fn orchestrate(crew: Crew, goal: String, history: String, tx: UnboundedSender<Msg>, stop: Arc<AtomicBool>) {
     let boss = crew.manager.name.clone();
     let log = |kind, text: String| tx.send(Msg::Log(boss.clone(), kind, text)).ok();
     let names: Vec<String> = crew.workers.iter().map(|w| w.name.clone()).collect();
 
-    let (_, reply) = run_agent(crew.manager.clone(), manager_prompt(&goal, &crew.workers), tx.clone()).await;
+    let (ok, reply) = run_agent(crew.manager.clone(), manager_prompt(&goal, &crew.workers, &history), tx.clone()).await;
     let mut plan = parse_plan(&reply, &names);
-    if plan.is_empty() {
-        log(Kind::Bad, "No usable plan in the manager's reply.".into());
+    if plan.is_empty() && ok {
+        log(Kind::Good, "Answered directly, no work needed.".into());
+        tx.send(Msg::Remember(format!("User: {goal}\nManager: {}", tail(&reply, 1_500)))).ok();
     }
     let mut report = String::new();
     let mut round = 1;
@@ -293,6 +347,7 @@ pub async fn orchestrate(crew: Crew, goal: String, tx: UnboundedSender<Msg>, sto
         plan = if last { vec![] } else { parse_plan(&review, &names) };
         if plan.is_empty() {
             log(Kind::Good, format!("Done after {round} round(s)."));
+            tx.send(Msg::Remember(format!("User: {goal}\nManager (after {round} round(s) of work): {}", tail(&review, 1_500)))).ok();
             tx.send(Msg::Notify("Crew finished".into())).ok();
         }
         round += 1;
@@ -336,8 +391,9 @@ mod tests {
     }
 
     /// Fake manager: plans coder, then on review asks checker for a round 2, then says done.
-    async fn run_crew(max_rounds: u32) -> Vec<Msg> {
+    async fn run_crew(max_rounds: u32, goal: &str) -> Vec<Msg> {
         let script = r##"case "$1" in
+            *"hello"*) echo 'Hi there!' ;;
             *"no prose"*) echo '[{"worker": "coder", "role": "dev", "task": "write it"}]' ;;
             *"# Round 2"*) echo 'ALL DONE' ;;
             *) echo 'REVIEW1 more work: [{"worker": "checker", "role": "qa", "task": "check it"}]' ;;
@@ -353,7 +409,7 @@ mod tests {
             ],
         };
         let (tx, mut rx) = unbounded_channel();
-        orchestrate(crew, "ship it".into(), tx, Arc::default()).await;
+        orchestrate(crew, goal.into(), "User: earlier\nManager: ok".into(), tx, Arc::default()).await;
         let mut msgs = vec![];
         while let Ok(m) = rx.try_recv() {
             msgs.push(m);
@@ -373,7 +429,7 @@ mod tests {
 
     #[tokio::test]
     async fn replans_until_done() {
-        let msgs = run_crew(3).await;
+        let msgs = run_crew(3, "ship it").await;
         assert!(log_of(&msgs, "coder").contains("WORKED"));
         let checker = log_of(&msgs, "checker");
         assert!(checker.contains("CHECKED") && checker.contains("WORKED"), "round 2 sees round 1");
@@ -381,11 +437,31 @@ mod tests {
         assert!(boss.contains("ALL DONE") && boss.contains("Done after 2 round(s)"));
         assert!(log_of(&msgs, "idler").is_empty());
         assert!(matches!(msgs.last(), Some(Msg::Finished)));
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Remember(r) if r.contains("ALL DONE"))));
+    }
+
+    #[tokio::test]
+    async fn answers_chat_without_workers() {
+        let msgs = run_crew(3, "hello").await;
+        let boss = log_of(&msgs, "manager");
+        assert!(boss.contains("Hi there!") && boss.contains("Answered directly"));
+        assert!(log_of(&msgs, "coder").is_empty() && log_of(&msgs, "checker").is_empty());
+    }
+
+    #[test]
+    fn strips_ansi() {
+        assert_eq!(strip_ansi("\x1b[0m> plan \x1b[1;32mPONG\x1b[0m\r"), "> plan PONG");
+    }
+
+    #[test]
+    fn manager_prompt_carries_history_and_delegates() {
+        let p = manager_prompt("fix it", &[], "User: hi\nManager: hello");
+        assert!(p.contains("User: hi") && p.contains("(none)") && p.contains("do not do"));
     }
 
     #[tokio::test]
     async fn stops_at_round_cap() {
-        let msgs = run_crew(1).await;
+        let msgs = run_crew(1, "ship it").await;
         assert!(log_of(&msgs, "checker").is_empty());
         assert!(log_of(&msgs, "manager").contains("Done after 1 round(s)"));
     }

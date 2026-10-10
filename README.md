@@ -1,6 +1,8 @@
 # foreman
 
-A terminal UI, written in Rust, for running a crew of AI agents. A **manager** agent reads your goal, gives each **worker** a role and a task, runs them (in parallel, or in steps when one depends on another), and then reviews what they did. If the goal isn't met yet, the manager assigns another round, up to `max_rounds`.
+A terminal UI, written in Rust, for running a crew of AI agents. You only talk to the **manager**. It doesn't do the work itself: it gives each **worker** a role and a task, runs them (in parallel, or in steps when one depends on another), and then reviews what they did. If the goal isn't met yet, the manager assigns another round, up to `max_rounds`. Questions and chat that need no work, the manager answers itself, and it remembers the conversation.
+
+By default the manager runs on a free [opencode](https://opencode.ai) model in opencode's read-only `plan` agent, so it can't edit files even if it tries. Press `Ctrl+O` to pick any opencode model, free or local, for the manager or any worker.
 
 ```
  ⚒ foreman   ~/Projects                                                                     ○ idle
@@ -36,7 +38,7 @@ cargo install --git https://github.com/GbaGuy/foreman
 # or from a clone: cargo run --release
 ```
 
-You need at least one agent CLI installed and logged in.
+You need `opencode` for the manager (or point it at another CLI in the config), plus whatever CLIs your workers use.
 
 ## Use
 
@@ -44,8 +46,8 @@ Run `foreman` in the directory you want the crew to work in.
 
 | Key / input | What it does |
 |---|---|
-| type a goal + `Enter` | The manager plans, the workers run, the manager reviews and re-plans until done |
-| `@coder fix the tests` | Sends a message straight to one agent |
+| type a message + `Enter` | Talks to the manager: it answers, or plans, runs the workers, reviews and re-plans until done |
+| `Ctrl+O` | Picks an opencode model for the selected agent (free ones first) |
 | `Ctrl+S` | Stops once the running agents finish |
 | `Ctrl+N` | Adds a worker: name, default role, backend, command |
 | `Ctrl+R` | Removes the selected worker |
@@ -63,15 +65,15 @@ The crew is saved in `~/.config/foreman/crew.json`. Edit it to change the manage
 ```json
 {
   "max_rounds": 3,
-  "manager": {"name": "manager", "command": "claude -p {prompt}", "role": "Engineering lead"},
+  "manager": {"name": "manager", "command": "opencode run -m opencode/nemotron-3.5-lightning-free --agent plan {prompt}", "role": "Engineering lead"},
   "workers": [
-    {"name": "coder", "command": "codex exec {prompt}", "role": "Writes and edits code"},
+    {"name": "coder", "command": "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}", "role": "Writes and edits code"},
     {"name": "reviewer", "command": "claude -p {prompt}", "role": "Reviews work for bugs"}
   ]
 }
 ```
 
-`max_rounds` (default 3) caps how many plan, work, review rounds one goal can take. Commands run without a shell, and the prompt is passed as a single argument. Each CLI keeps its own permission settings. For example, `claude -p` can't edit files until you add something like `--permission-mode acceptEdits` to its command.
+`max_rounds` (default 3) caps how many plan, work, review rounds one goal can take. Commands run without a shell, and the prompt is passed as a single argument. Each CLI keeps its own permission settings. For example, `opencode run` can't edit files until you add `--auto`, and `claude -p` needs something like `--permission-mode acceptEdits`.
 
 ## Develop
 

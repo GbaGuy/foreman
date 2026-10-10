@@ -1,8 +1,9 @@
 //! foreman: a terminal boss for a crew of AI agents.
 //!
-//! A manager agent reads your goal, gives each worker a role and a task, the
-//! workers run (in parallel or in steps), and the manager reviews and re-plans
-//! until the goal is met. Every agent is a CLI command with {prompt} in it.
+//! You only talk to the manager. It doesn't do the work itself: it gives each
+//! worker a role and a task, the workers run (in parallel or in steps), and the
+//! manager reviews and re-plans until the goal is met. Every agent is a CLI
+//! command with {prompt} in it.
 
 mod crew;
 
@@ -56,6 +57,13 @@ struct Form {
     error: String,
 }
 
+/// The opencode model picker for one agent.
+struct Picker {
+    agent: usize,
+    models: Vec<(String, &'static str)>, // (name, "free" / "local" / "")
+    sel: usize,
+}
+
 struct App {
     crew: Crew,
     states: HashMap<String, State>,
@@ -68,6 +76,8 @@ struct App {
     stop: Arc<AtomicBool>,
     toast: Option<(String, Instant)>,
     form: Option<Form>,
+    picker: Option<Picker>,
+    history: String, // past user/manager exchanges, fed back to the manager
     theme: usize,
     cwd: String,
     tx: UnboundedSender<Msg>,
@@ -101,6 +111,14 @@ impl App {
             Msg::State(name, state) => _ = self.states.insert(name, state),
             Msg::Role(name, role) => _ = self.roles.insert(name, role),
             Msg::Notify(text) => self.toast(text),
+            Msg::Remember(text) => {
+                self.history.push_str(&text);
+                self.history.push_str("\n\n");
+                // ponytail: keep the last ~6k chars; summarise old turns if the manager needs longer memory
+                let cut = self.history.len().saturating_sub(6_000);
+                let cut = (cut..self.history.len()).find(|&i| self.history.is_char_boundary(i)).unwrap_or(0);
+                self.history.drain(..cut);
+            }
             Msg::Finished => self.busy = false,
         }
     }
@@ -110,12 +128,16 @@ impl App {
         if self.form.is_some() {
             return self.form_key(k);
         }
+        if self.picker.is_some() {
+            return self.picker_key(k);
+        }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let n = self.agents().len();
         match k.code {
             KeyCode::Char('q' | 'c') if ctrl => self.quit = true,
             KeyCode::Char('n') if ctrl => self.form = Some(Form { fields: [String::new(), String::new(), BACKENDS[0].1.into()], ..Default::default() }),
             KeyCode::Char('r') if ctrl => self.remove_worker(),
+            KeyCode::Char('o') if ctrl => self.open_picker(),
             KeyCode::Char('s') if ctrl && self.busy => {
                 self.stop.store(true, Ordering::Relaxed);
                 self.toast("Stopping after the running agents finish");
@@ -145,25 +167,12 @@ impl App {
         if self.busy {
             return self.toast("The crew is still working");
         }
-        let tx = self.tx.clone();
-        if let Some(rest) = text.strip_prefix('@') {
-            let (name, msg) = rest.split_once(' ').unwrap_or((rest, ""));
-            let Some(agent) = self.crew.find(name).cloned().filter(|_| !msg.trim().is_empty()) else {
-                let names: Vec<_> = self.agents().iter().map(|a| a.name.clone()).collect();
-                return self.toast(format!("Usage: @<agent> message — agents: {}", names.join(", ")));
-            };
-            let msg = msg.trim().to_string();
-            self.select(&agent.name);
-            self.rt.spawn(async move {
-                crew::run_agent(agent, msg, tx.clone()).await;
-                tx.send(Msg::Finished).ok();
-            });
-        } else {
-            self.select(&self.crew.manager.name.clone());
-            self.stop.store(false, Ordering::Relaxed);
-            self.roles.clear();
-            self.rt.spawn(crew::orchestrate(self.crew.clone(), text, tx, self.stop.clone()));
-        }
+        self.select(&self.crew.manager.name.clone());
+        self.stop.store(false, Ordering::Relaxed);
+        self.roles.clear();
+        let log = self.logs.entry(self.crew.manager.name.clone()).or_default();
+        log.extend([(Kind::Out, String::new()), (Kind::Good, format!("you › {text}"))]);
+        self.rt.spawn(crew::orchestrate(self.crew.clone(), text, self.history.clone(), self.tx.clone(), self.stop.clone()));
         self.busy = true;
         self.input.clear();
     }
@@ -182,6 +191,48 @@ impl App {
     fn save(&mut self) {
         if let Err(e) = self.crew.save() {
             self.toast(format!("Could not save crew: {e}"));
+        }
+    }
+
+    fn open_picker(&mut self) {
+        if self.busy {
+            return self.toast("Wait until the crew is idle");
+        }
+        match crew::opencode_models() {
+            Ok(models) => {
+                let current = self.agents()[self.selected].command.clone();
+                let sel = models.iter().position(|(m, _)| current.contains(m.as_str())).unwrap_or(0);
+                self.picker = Some(Picker { agent: self.selected, models, sel });
+            }
+            Err(e) => self.toast(e),
+        }
+    }
+
+    fn picker_key(&mut self, k: KeyEvent) {
+        let p = self.picker.as_mut().unwrap();
+        let n = p.models.len();
+        match k.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Down | KeyCode::Tab => p.sel = (p.sel + 1) % n,
+            KeyCode::Up | KeyCode::BackTab => p.sel = (p.sel + n - 1) % n,
+            KeyCode::PageDown => p.sel = (p.sel + 10).min(n - 1),
+            KeyCode::PageUp => p.sel = p.sel.saturating_sub(10),
+            KeyCode::Enter => {
+                let (model, i) = (p.models[p.sel].0.clone(), p.agent);
+                self.picker = None;
+                // ponytail: rewrites the whole command, dropping custom flags; edit crew.json for those
+                let command = if i == 0 {
+                    format!("opencode run -m {model} --agent plan {{prompt}}")
+                } else {
+                    format!("opencode run -m {model} {{prompt}}")
+                };
+                let agent = if i == 0 { &mut self.crew.manager } else { &mut self.crew.workers[i - 1] };
+                agent.command = command;
+                let name = agent.name.clone();
+                self.save();
+                self.toast(format!("{name} now uses {model}"));
+            }
+            _ => {}
         }
     }
 
@@ -244,13 +295,12 @@ impl App {
         self.draw_crew(f, side);
         self.draw_output(f, main);
 
-        let at = self.input.starts_with('@');
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(t.accent))
-            .title(Span::styled(if at { " message " } else { " goal " }, Style::new().fg(t.accent).bold()));
+            .title(Span::styled(format!(" to {} ", self.crew.manager.name), Style::new().fg(t.accent).bold()));
         let (text, style) = if self.input.is_empty() {
-            ("Goal for the manager…  (or @worker message to talk to one directly)", Style::new().fg(t.dim))
+            ("Tell the manager what you need…", Style::new().fg(t.dim))
         } else {
             (self.input.as_str(), Style::new().fg(t.text))
         };
@@ -258,12 +308,12 @@ impl App {
         // keep the end of a long line in view
         let skip = self.input.chars().count().saturating_sub(inner.width.saturating_sub(1) as usize);
         f.render_widget(Paragraph::new(Span::styled(text.chars().skip(skip).collect::<String>(), style)).block(block), input);
-        if self.form.is_none() {
+        if self.form.is_none() && self.picker.is_none() {
             let x = inner.x + (self.input.chars().count() - skip) as u16;
             f.set_cursor_position(Position::new(x, inner.y));
         }
 
-        let keys = [("^N", "add"), ("^R", "remove"), ("^S", "stop"), ("^T", "theme"), ("Tab", "switch"), ("PgUp/Dn", "scroll"), ("^Q", "quit")];
+        let keys = [("^N", "add"), ("^R", "remove"), ("^O", "model"), ("^S", "stop"), ("^T", "theme"), ("Tab", "switch"), ("PgUp/Dn", "scroll"), ("^Q", "quit")];
         let spans: Vec<Span> = keys
             .iter()
             .flat_map(|(k, d)| [Span::styled(format!(" {k}"), Style::new().fg(t.accent).bold()), Span::styled(format!(" {d} "), Style::new().fg(t.dim))])
@@ -277,6 +327,9 @@ impl App {
 
         if let Some(form) = &self.form {
             self.draw_form(f, form);
+        }
+        if let Some(p) = &self.picker {
+            self.draw_picker(f, p);
         }
     }
 
@@ -302,7 +355,12 @@ impl App {
                 if i == 0 {
                     top.push(Span::styled(" ★", Style::new().fg(t.primary)));
                 }
-                let backend = a.command.split_whitespace().next().unwrap_or_default();
+                let words: Vec<&str> = a.command.split_whitespace().collect();
+                let model = words.iter().position(|w| *w == "-m" || *w == "--model").and_then(|i| words.get(i + 1));
+                let backend = match model {
+                    Some(m) => format!("{} · {}", words[0], m.rsplit('/').next().unwrap_or(m)),
+                    None => words.first().unwrap_or(&"").to_string(),
+                };
                 ListItem::new(vec![
                     Line::from(top),
                     Line::styled(format!("  {}", if role.is_empty() { "—" } else { role }), Style::new().fg(t.secondary)),
@@ -361,12 +419,38 @@ impl App {
                     gap.into_iter().chain([Line::styled(text.clone(), style)])
                 })
                 .collect(),
-            None if self.selected == 0 => vec![Line::styled("Ready. Type a goal below; I'll give the workers roles and tasks.", Style::new().fg(t.dim))],
+            None if self.selected == 0 => vec![Line::styled("Ready. Tell me what you need; I'll give the workers roles and tasks.", Style::new().fg(t.dim))],
             None => vec![Line::styled("No output yet.", Style::new().fg(t.dim))],
         };
         let para = Paragraph::new(lines).wrap(Wrap { trim: false });
         let bottom = (para.line_count(log.width) as u16).saturating_sub(log.height);
         f.render_widget(para.scroll((bottom.saturating_sub(self.scroll_back), 0)), log);
+    }
+
+    fn draw_picker(&self, f: &mut Frame, p: &Picker) {
+        let t = self.t();
+        let area = f.area().centered(Constraint::Length(96), Constraint::Percentage(70));
+        f.render_widget(Clear, area);
+        let items: Vec<ListItem> = p
+            .models
+            .iter()
+            .map(|(m, tag)| {
+                let color = if *tag == "free" { t.good } else { t.info };
+                let tag = Span::styled(format!("{tag:<6}"), Style::new().fg(color).bold());
+                ListItem::new(Line::from(vec![tag, Span::styled(m.as_str(), Style::new().fg(t.text))]))
+            })
+            .collect();
+        let list = List::new(items)
+            .block(
+                Block::bordered()
+                    .border_type(BorderType::Thick)
+                    .border_style(Style::new().fg(t.primary))
+                    .title(Span::styled(format!(" opencode model for {} ", self.agents()[p.agent].name), Style::new().fg(t.accent).bold()))
+                    .title_bottom(Line::styled(" ↑/↓ choose · Enter use · Esc cancel ", Style::new().fg(t.dim)).right_aligned()),
+            )
+            .highlight_style(Style::new().bg(t.sel).fg(t.accent))
+            .highlight_symbol("▌");
+        f.render_stateful_widget(list, area, &mut ListState::default().with_selected(Some(p.sel)));
     }
 
     fn draw_form(&self, f: &mut Frame, form: &Form) {
@@ -430,6 +514,8 @@ fn main() -> std::io::Result<()> {
         stop: Arc::default(),
         toast: None,
         form: None,
+        picker: None,
+        history: String::new(),
         theme: 0,
         cwd: if home.is_empty() { cwd.clone() } else { cwd.replacen(&home, "~", 1) },
         tx,
