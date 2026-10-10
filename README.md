@@ -1,35 +1,38 @@
 # foreman
 
-A terminal UI, written in Rust, for running a crew of AI agents. You only talk to the **manager**. It doesn't do the work itself: it gives each **worker** a role and a task, runs them (in parallel, or in steps when one depends on another), and then reviews what they did. If the goal isn't met yet, the manager assigns another round, up to `max_rounds`. Questions and chat that need no work, the manager answers itself, and it remembers the conversation.
+A terminal UI, written in Rust, where you talk to one AI **manager** and it gets the work done with a team of AI **workers** that it creates as needed.
 
-The manager is always Claude (`claude -p`), limited to read-only tools (`--tools=Read,Grep,Glob`). It can look at the project to plan, but it can't edit files or run commands even if it tries. Workers can run on any CLI. Press `Ctrl+O` to pick a Claude model (opus, sonnet, haiku) for the manager, or an [opencode](https://opencode.ai) model, free ones first, for a worker.
+- You only see and talk to the manager.
+- The manager is Claude. It doesn't do the work itself: for each job it creates workers, gives each a name, a role and a task, and runs them in parallel, or in steps when one depends on another (a tester after a builder, for example).
+- It reviews what the workers did and, if the goal isn't met, creates more workers for another round, up to `max_rounds`.
+- For a question or chat that needs no work, it just answers. It remembers the conversation.
 
 ```
- ⚒ foreman   ~/Projects                                                                     ○ idle
-╭ crew ──────────────────────────╮╭ output ────────────────────────────────────────────────────────╮
-│▌● manager ★                    ││ ● manager │ ● coder │ ○ reviewer │ ○ tester                    │
-│   Engineering lead             ││                                                                │
-│   sh                           ││                                                                │
-│                                ││▶ You manage a team of AI agents working in the current         │
-│ ● coder                        ││directory.                                                      │
-│   Writer                       ││planning...                                                     │
-│   sh                           ││[{"worker": "coder", "role": "Writer", "task": "write a poem"}] │
-│                                ││Round 1 assignments                                             │
-│ ○ reviewer                     ││  step 1  coder as Writer: write a poem                         │
-│   Reviews work                 ││                                                                │
-│   echo                         ││▶ Goal: write a poem about the sea                              │
-│                                ││looks good, goal met                                            │
-│                                ││Done after 1 round(s).                                          │
-│                                ││                                                                │
-│                                ││                                                                │
-╰────────────────────────────────╯╰────────────────────────────────────────────────────────────────╯
+ ⚒ foreman   ~/projects/todo                                                                  ○ idle
+╭ ★ manager · claude sonnet ───────────────────────────────────────────────────────────────────────╮
+│                                                                                                  │
+│ you › Make a tiny todo CLI and test it                                                           │
+│ Round 1: 2 worker(s)                                                                             │
+│   step 1 · builder (Python developer): Create todo.py with add, list and done                    │
+│   step 2 · tester (QA tester): Write and run tests for todo.py                                   │
+│ ● builder finished                                                                               │
+│ ● tester finished                                                                                │
+│ The goal is met. todo.py has add, list and done, and all 5 tests pass.                           │
+│ Done after 1 round(s).                                                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭ workers · opencode/nemotron-3.5-lightning-free ──────────────────────────────────────────────────╮
+│ ● builder       Python developer                                                                 │
+│ ● tester        QA tester                                                                        │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ╭ to manager ──────────────────────────────────────────────────────────────────────────────────────╮
 │Tell the manager what you need…                                                                   │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
- ^N add  ^R remove  ^O model  ^S stop  ^T theme  Tab switch  PgUp/Dn scroll  ^Q quit            Crew finished
+ ^O manager model  ^W worker model  ^S stop  ^T theme  ↑↓/PgUp/PgDn scroll  ^Q quit   Crew finished
 ```
-
-Each agent is a CLI command with `{prompt}` in it, so any agent CLI works: `claude`, `codex`, `opencode`, or your own script. You can mix them, for example a Claude manager running Codex coders.
 
 ## Install
 
@@ -38,42 +41,41 @@ cargo install --git https://github.com/GbaGuy/foreman
 # or from a clone: cargo run --release
 ```
 
-You need `claude` (Claude Code) logged in for the manager, plus whatever CLIs your workers use, for example `opencode` for free models.
+You need `claude` (Claude Code) logged in for the manager, and `opencode` for the workers (or any other agent CLI, see below).
 
 ## Use
 
-Run `foreman` in the directory you want the crew to work in.
+Run `foreman` in the folder you want the work done in.
 
-| Key / input | What it does |
+| Key | What it does |
 |---|---|
-| type a message + `Enter` | Talks to the manager: it answers, or plans, runs the workers, reviews and re-plans until done |
-| `Ctrl+O` | Picks a model: Claude models for the manager, opencode models (free first) for workers |
-| `Ctrl+S` | Stops once the running agents finish |
-| `Ctrl+N` | Adds a worker: name, default role, backend, command |
-| `Ctrl+R` | Removes the selected worker |
-| `Tab` / `↑` `↓` | Switches between agents' output tabs |
-| `PgUp` / `PgDn` / `End` | Scrolls the output; `End` jumps back to the bottom |
+| type + `Enter` | Talks to the manager |
+| `Ctrl+O` | Picks the manager's Claude model (opus, sonnet, haiku) |
+| `Ctrl+W` | Picks the workers' opencode model, free models first |
+| `Ctrl+S` | Stops once the running workers finish |
+| `↑` `↓` / `PgUp` `PgDn` / `End` | Scrolls the chat; `End` jumps back to the bottom |
 | `Ctrl+T` | Switches the colour theme (tokyo-night, catppuccin, gruvbox) |
 | `Ctrl+Q` | Quits |
 
-The sidebar shows each agent's state (○ idle, ◐ working, ● done, ✗ failed) and the role the manager gave it on this run.
+The workers strip shows each worker of the current job with its role and state (spinner while working, ● done, ✗ failed). Their raw output isn't shown; the manager reads it and reports to you.
 
 ## Configure
 
-The crew is saved in `~/.config/foreman/crew.json`. Edit it to change the manager or give agents extra flags:
+Settings live in `~/.config/foreman/crew.json`:
 
 ```json
 {
   "max_rounds": 3,
-  "manager": {"name": "manager", "command": "claude -p --tools=Read,Grep,Glob {prompt}", "role": "Engineering lead"},
-  "workers": [
-    {"name": "coder", "command": "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}", "role": "Writes and edits code"},
-    {"name": "reviewer", "command": "claude -p {prompt}", "role": "Reviews work for bugs"}
-  ]
+  "manager": "claude -p --tools=Read,Grep,Glob {prompt}",
+  "worker": "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}"
 }
 ```
 
-Keep the `=` in `--tools=...`: without it the flag swallows the prompt. `max_rounds` (default 3) caps how many plan, work, review rounds one goal can take. Commands run without a shell, and the prompt is passed as a single argument. Each CLI keeps its own permission settings. For example, `opencode run` can't edit files until you add `--auto`, and `claude -p` needs something like `--permission-mode acceptEdits`.
+- `manager` runs Claude with read-only tools, so it can look at the project to plan but can't edit files or run commands. Keep the `=` in `--tools=...`: without it the flag swallows the prompt.
+- `worker` is the command every worker runs. Workers need permission to act, which is what `--auto` gives opencode. You can use any agent CLI here, for example `claude -p --permission-mode acceptEdits {prompt}` or `codex exec {prompt}`.
+- `max_rounds` caps how many plan, work, review rounds one message can take.
+
+Commands run without a shell, and the prompt is passed as a single argument.
 
 ## Develop
 
