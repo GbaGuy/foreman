@@ -110,18 +110,67 @@ pub fn with_model(command: &str, model: &str) -> String {
     }
 }
 
-/// The plan format, and which models the manager may give workers.
+/// The plan format, and which models the manager may give workers, with each one's track record.
 fn plan_format(models: &[String]) -> String {
     let model = if models.is_empty() {
         "Leave out \"model\".".to_string()
     } else {
+        let record = ModelRecord::load();
+        let list: Vec<String> = models.iter().map(|m| format!("- {m}: {}", record.get(m).map_or("no record yet".into(), ModelRun::describe))).collect();
         format!(
-            "\"model\" is the worker's AI model: pick the one from this list that best suits its task \
-             (a strong coder for code, a fast one for simple jobs), or leave it out for the default: {}.",
-            models.join(", ")
+            "\"model\" is the worker's AI model. Pick one from this list for each worker, or leave it out \
+             for the default. Each comes with foreman's record of its past workers: prefer models that \
+             finish their work, avoid ones that often fail or get stopped, and try an untried model on a \
+             small task first.\n{}",
+            list.join("\n")
         )
     };
     format!("{PLAN_FORMAT}\n{model}")
+}
+
+/// foreman's own state folder: `$XDG_STATE_HOME/foreman` or `~/.local/state/foreman`.
+pub fn state_dir() -> PathBuf {
+    let base = std::env::var_os("XDG_STATE_HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/state"));
+    base.join("foreman")
+}
+
+/// How a model's workers have done so far.
+#[derive(Clone, Copy, Default, Serialize, Deserialize, Debug, PartialEq)]
+pub struct ModelRun {
+    pub runs: u32,
+    pub finished: u32,
+    pub tokens: u64,
+}
+
+impl ModelRun {
+    fn describe(&self) -> String {
+        let avg = self.tokens / u64::from(self.runs.max(1)) / 1_000;
+        format!("{} workers, {} finished, {} failed or stopped, about {avg}k tokens each", self.runs, self.finished, self.runs - self.finished)
+    }
+}
+
+/// Every model's record, kept in the state folder across sessions.
+pub struct ModelRecord;
+
+impl ModelRecord {
+    fn path() -> PathBuf {
+        state_dir().join("models.json")
+    }
+
+    pub fn load() -> HashMap<String, ModelRun> {
+        std::fs::read_to_string(Self::path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default()
+    }
+
+    /// Add one worker's outcome. Workers finish in parallel, so the read-modify-write is locked.
+    pub fn add(model: &str, finished: bool, tokens: u64) {
+        static LOCK: Mutex<()> = Mutex::new(());
+        let _guard = LOCK.lock();
+        let mut all = Self::load();
+        let run = all.entry(model.to_string()).or_default();
+        (run.runs, run.finished, run.tokens) = (run.runs + 1, run.finished + u32::from(finished), run.tokens + tokens);
+        std::fs::create_dir_all(state_dir()).ok();
+        std::fs::write(Self::path(), serde_json::to_string_pretty(&all).unwrap_or_default()).ok();
+    }
 }
 
 /// The model a command asks for (`-m x`, `--model x`, `--model=x`), if any.
@@ -133,7 +182,7 @@ pub fn model_of(command: &str) -> Option<&str> {
     })
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum State {
     Working,
     Done,
@@ -141,7 +190,7 @@ pub enum State {
 }
 
 /// How a chat line should look; the UI maps these to theme colours.
-#[derive(Clone, Copy, PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug, Serialize, Deserialize)]
 pub enum Kind {
     User,
     Rule, // a section divider, e.g. "Round 1 · 2 workers"
@@ -181,7 +230,7 @@ pub enum Msg {
     Finished,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub worker: String,
     pub role: String,
@@ -689,15 +738,19 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], dir: &Path, report: &m
             for (i, t) in group.iter().enumerate() {
                 let prompt = worker_prompt(t, goal, &earlier);
                 let command = own_files(&with_model(&crew.worker, &t.model), &t.files, dir);
+                let model = model_of(&command).unwrap_or_default().to_string();
                 let (tx, t, slots, dir) = (tx.clone(), (*t).clone(), slots.clone(), dir.to_path_buf());
                 set.spawn(async move {
                     let _slot = slots.acquire_owned().await;
                     tx.send(Msg::Worker(t.worker.clone(), State::Working)).ok();
                     let echo = |line: &str| _ = tx.send(Msg::Output(t.worker.clone(), line.to_string()));
                     let count = |u: Usage| _ = tx.send(Msg::Usage(t.worker.clone(), u));
-                    let (ok, out, _) = tokio::time::timeout(timeout, run_command(&command, &prompt, &dir, idle, max_tokens, echo, count))
+                    let (ok, out, used) = tokio::time::timeout(timeout, run_command(&command, &prompt, &dir, idle, max_tokens, echo, count))
                         .await
                         .unwrap_or_else(|_| (false, format!("timed out after {} min", timeout.as_secs() / 60), Usage::default()));
+                    if !model.is_empty() {
+                        ModelRecord::add(&model, ok, used.input + used.output);
+                    }
                     tx.send(Msg::Worker(t.worker.clone(), if ok { State::Done } else { State::Failed })).ok();
                     if !ok {
                         tx.send(Msg::Log(Kind::Bad, format!("{} failed: {}", t.worker, last_line(&out)))).ok();
@@ -961,7 +1014,9 @@ mod tests {
             p.contains("User: hi") && p.contains("create") && p.contains("do not do") && p.contains("never own the same file") && p.contains("as many workers as the job needs")
         );
         assert!(review_prompt("g", "r", false, &[]).contains("check the actual files"));
-        assert!(manager_prompt("x", "", &["opencode/a-free".into()]).contains("opencode/a-free"));
+        assert!(manager_prompt("x", "", &["opencode/a-free".into()]).contains("- opencode/a-free: "));
+        let run = ModelRun { runs: 4, finished: 3, tokens: 400_000 };
+        assert_eq!(run.describe(), "4 workers, 3 finished, 1 failed or stopped, about 100k tokens each");
         assert!(worker_prompt(&task("b", &[], 1), "g", "").contains("shell tool"));
         assert!(worker_prompt(&task("b", &[], 1), "g", "").contains(" ask b "));
         let w = worker_prompt(&task("b", &["calc.py"], 1), "g", "");
