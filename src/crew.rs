@@ -14,8 +14,14 @@ pub const BACKENDS: [(&str, &str); 3] = [
     ("codex", "codex exec {prompt}"),
     ("opencode", "opencode run -m opencode/nemotron-3.5-lightning-free {prompt}"),
 ];
-/// The manager runs opencode's read-only "plan" agent: it can look around but not do the work.
-pub const MANAGER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --agent plan {prompt}";
+/// The manager is Claude with read-only tools: it can look around but not do the work.
+/// (`--tools=` needs the "=": the flag takes several values and would swallow the prompt.)
+pub const MANAGER_COMMAND: &str = "claude -p --tools=Read,Grep,Glob {prompt}";
+pub const CLAUDE_MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
+
+pub fn manager_command(model: &str) -> String {
+    format!("claude -p --model {model} --tools=Read,Grep,Glob {{prompt}}")
+}
 const PLAN_FORMAT: &str = r#"[{"worker": "<name>", "role": "<role>", "task": "<task>", "step": 1}]"#;
 
 #[derive(Clone, Serialize, Deserialize)]

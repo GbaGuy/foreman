@@ -198,10 +198,16 @@ impl App {
         if self.busy {
             return self.toast("Wait until the crew is idle");
         }
-        match crew::opencode_models() {
+        // the manager is always Claude; workers pick from opencode's models
+        let models = if self.selected == 0 {
+            Ok(crew::CLAUDE_MODELS.iter().map(|m| (m.to_string(), "claude")).collect())
+        } else {
+            crew::opencode_models()
+        };
+        match models {
             Ok(models) => {
                 let current = self.agents()[self.selected].command.clone();
-                let sel = models.iter().position(|(m, _)| current.contains(m.as_str())).unwrap_or(0);
+                let sel = models.iter().position(|(m, _)| current.split_whitespace().any(|w| w == m)).unwrap_or(0);
                 self.picker = Some(Picker { agent: self.selected, models, sel });
             }
             Err(e) => self.toast(e),
@@ -222,7 +228,7 @@ impl App {
                 self.picker = None;
                 // ponytail: rewrites the whole command, dropping custom flags; edit crew.json for those
                 let command = if i == 0 {
-                    format!("opencode run -m {model} --agent plan {{prompt}}")
+                    crew::manager_command(&model)
                 } else {
                     format!("opencode run -m {model} {{prompt}}")
                 };
@@ -435,8 +441,12 @@ impl App {
             .models
             .iter()
             .map(|(m, tag)| {
-                let color = if *tag == "free" { t.good } else { t.info };
-                let tag = Span::styled(format!("{tag:<6}"), Style::new().fg(color).bold());
+                let color = match *tag {
+                    "free" => t.good,
+                    "claude" => t.accent,
+                    _ => t.info,
+                };
+                let tag = Span::styled(format!("{tag:<7}"), Style::new().fg(color).bold());
                 ListItem::new(Line::from(vec![tag, Span::styled(m.as_str(), Style::new().fg(t.text))]))
             })
             .collect();
@@ -445,7 +455,7 @@ impl App {
                 Block::bordered()
                     .border_type(BorderType::Thick)
                     .border_style(Style::new().fg(t.primary))
-                    .title(Span::styled(format!(" opencode model for {} ", self.agents()[p.agent].name), Style::new().fg(t.accent).bold()))
+                    .title(Span::styled(format!(" {} model for {} ", if p.agent == 0 { "Claude" } else { "opencode" }, self.agents()[p.agent].name), Style::new().fg(t.accent).bold()))
                     .title_bottom(Line::styled(" ↑/↓ choose · Enter use · Esc cancel ", Style::new().fg(t.dim)).right_aligned()),
             )
             .highlight_style(Style::new().bg(t.sel).fg(t.accent))
