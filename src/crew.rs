@@ -15,18 +15,21 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::task::JoinSet;
 
 /// The manager is Claude with read-only tools: it can look around but not do the work.
+/// stream-json lets the UI show it thinking, reading files, and writing its reply live.
 /// (`--tools=` needs the "=": the flag takes several values and would swallow the prompt.)
-pub const MANAGER_COMMAND: &str = "claude -p --tools=Read,Grep,Glob {prompt}";
-pub const WORKER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --auto {prompt}";
+pub const MANAGER_COMMAND: &str =
+    "claude -p --output-format stream-json --verbose --include-partial-messages --tools=Read,Grep,Glob {prompt}";
+/// `--thinking` puts the worker's reasoning in its output, so you and the manager can both read it.
+pub const WORKER_COMMAND: &str = "opencode run -m opencode/nemotron-3.5-lightning-free --auto --thinking {prompt}";
 pub const CLAUDE_MODELS: [&str; 3] = ["opus", "sonnet", "haiku"];
 const PLAN_FORMAT: &str = r#"[{"worker": "<short-name>", "role": "<role>", "task": "<task>", "step": 1}]"#;
 
 pub fn manager_command(model: &str) -> String {
-    format!("claude -p --model {model} --tools=Read,Grep,Glob {{prompt}}")
+    MANAGER_COMMAND.replacen("claude -p", &format!("claude -p --model {model}"), 1)
 }
 
 pub fn worker_command(model: &str) -> String {
-    format!("opencode run -m {model} --auto {{prompt}}")
+    format!("opencode run -m {model} --auto --thinking {{prompt}}")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -101,6 +104,7 @@ pub enum State {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     User,
+    Think, // the manager's live activity: files it reads, searches it runs
     Out,
     Info,
     Good,
@@ -112,6 +116,8 @@ pub enum Kind {
 pub enum Msg {
     Log(Kind, String),
     Manager(State),
+    Thinking(u64),       // the manager is thinking; roughly this many more tokens
+    ManagerText(String), // a chunk of the manager's reply as it's written
     Worker(String, String, State), // name, role, state
     Output(String, String),        // a worker's output line: name, line
     Notify(String),
@@ -153,7 +159,8 @@ pub fn manager_prompt(message: &str, history: &str) -> String {
          If this needs any work done (code, files, research, writing, checking), reply with ONLY a JSON \
          array creating the workers, no prose. Use as few workers as the job needs. Tasks with the same \
          step run in parallel; a later step sees the output of earlier steps, so anything that checks \
-         work (review, testing) must have a higher step than the work it checks:\n{PLAN_FORMAT}\n\n\
+         work (review, testing) must have a higher step than the work it checks. Never give two workers in \
+         the same step the same file to edit; they would overwrite each other:\n{PLAN_FORMAT}\n\n\
          Only if it is a quick question or chat that needs no work, answer it yourself in plain text \
          with no JSON."
     )
@@ -170,8 +177,10 @@ pub fn review_prompt(goal: &str, report: &str, last_round: bool) -> String {
         )
     };
     format!(
-        "Goal: {goal}\n\nYour workers reported:\n{report}\n\nReview their work: what got done and what is \
-         missing. Do not do missing work yourself; create workers for it. {ask}"
+        "Goal: {goal}\n\nYour workers reported (including their reasoning):\n{report}\n\n\
+         Review their work. Don't take their word for it: use your read tools to check the actual files \
+         they made or changed, and look for mistakes in their reasoning, files they overwrote, and claims \
+         that don't match the files. Do not fix anything yourself; create workers to fix it. {ask}"
     )
 }
 
@@ -336,10 +345,69 @@ async fn run_plan(crew: &Crew, goal: &str, plan: &[Task], report: &mut String, t
     }
 }
 
+/// What one line of Claude's stream-json output means for the UI.
+#[derive(Debug, PartialEq)]
+pub enum Stream {
+    Thinking(u64),
+    Tool(String),
+    Text(String),
+}
+
+pub fn parse_stream(line: &str) -> Vec<Stream> {
+    let Ok(v) = serde_json::from_str::<Value>(line) else { return vec![] };
+    match v["type"].as_str() {
+        Some("stream_event") => {
+            let ev = &v["event"];
+            let item = match (ev["type"].as_str(), ev["delta"]["type"].as_str()) {
+                (Some("content_block_start"), _) if ev["content_block"]["type"] == "thinking" => Some(Stream::Thinking(0)),
+                (_, Some("thinking_delta")) => Some(Stream::Thinking(ev["delta"]["estimated_tokens"].as_u64().unwrap_or(0))),
+                (_, Some("text_delta")) => ev["delta"]["text"].as_str().map(|t| Stream::Text(t.into())),
+                _ => None,
+            };
+            item.into_iter().collect()
+        }
+        Some("assistant") => v["message"]["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|b| b["type"] == "tool_use")
+            .map(|b| {
+                let arg = ["file_path", "pattern", "path", "query"].iter().find_map(|k| b["input"][*k].as_str()).unwrap_or("");
+                Stream::Tool(format!("{} {arg}", b["name"].as_str().unwrap_or("tool")).trim().to_string())
+            })
+            .collect(),
+        _ => vec![],
+    }
+}
+
+/// The final answer in a stream-json transcript: (ok, text).
+pub fn stream_result(out: &str) -> Option<(bool, String)> {
+    out.lines().rev().find_map(|l| {
+        let v: Value = serde_json::from_str(l).ok()?;
+        (v["type"] == "result").then(|| (!v["is_error"].as_bool().unwrap_or(false), v["result"].as_str().unwrap_or("").to_string()))
+    })
+}
+
 /// Ask the manager; show its prose to the user and return (ok, prose, plan).
 async fn ask_manager(crew: &Crew, prompt: &str, tx: &UnboundedSender<Msg>) -> (bool, String, Vec<Task>) {
     tx.send(Msg::Manager(State::Working)).ok();
-    let (ok, reply) = run_command(&crew.manager, prompt, |_| ()).await;
+    let streaming = crew.manager.contains("stream-json");
+    let cwd = std::env::current_dir().map(|d| format!("{}/", d.display())).unwrap_or_default();
+    let live = |line: &str| {
+        for item in parse_stream(line) {
+            let msg = match item {
+                Stream::Thinking(n) => Msg::Thinking(n),
+                Stream::Text(t) => Msg::ManagerText(t),
+                Stream::Tool(t) => Msg::Log(Kind::Think, format!("→ {}", t.replace(&cwd, ""))),
+            };
+            tx.send(msg).ok();
+        }
+    };
+    let (ok, out) = run_command(&crew.manager, prompt, live).await;
+    let (ok, reply) = match streaming.then(|| stream_result(&out)).flatten() {
+        Some((good, text)) => (ok && good, text),
+        None => (ok, out),
+    };
     tx.send(Msg::Manager(if ok { State::Done } else { State::Failed })).ok();
     if !ok {
         tx.send(Msg::Log(Kind::Bad, format!("The manager failed: {}", last_line(&reply)))).ok();
@@ -420,6 +488,53 @@ mod tests {
         assert_eq!(model_of(WORKER_COMMAND), Some("opencode/nemotron-3.5-lightning-free"));
         assert_eq!(model_of("x --model=opus {prompt}"), Some("opus"));
         assert_eq!(model_of(MANAGER_COMMAND), None);
+        assert!(manager_command("opus").starts_with("claude -p --model opus --output-format stream-json"));
+    }
+
+    #[test]
+    fn parses_claude_stream() {
+        let think = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":50}}}"#;
+        let start = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}"#;
+        let text = r#"{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Hi"}}}"#;
+        let tools = r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"/p/a.txt"}},{"type":"tool_use","name":"Grep","input":{"pattern":"fn main"}}]}}"#;
+        assert_eq!(parse_stream(think), vec![Stream::Thinking(50)]);
+        assert_eq!(parse_stream(start), vec![Stream::Thinking(0)]);
+        assert_eq!(parse_stream(text), vec![Stream::Text("Hi".into())]);
+        assert_eq!(parse_stream(tools), vec![Stream::Tool("Read /p/a.txt".into()), Stream::Tool("Grep fn main".into())]);
+        assert!(parse_stream("not json").is_empty() && parse_stream(r#"{"type":"system"}"#).is_empty());
+        let out = format!("{text}\n{}\n", r#"{"type":"result","is_error":false,"result":"Final"}"#);
+        assert_eq!(stream_result(&out), Some((true, "Final".into())));
+        assert_eq!(stream_result("plain"), None);
+    }
+
+    /// A stream-json manager: its tool calls and thinking reach the UI, and the plan
+    /// comes from the final "result" event.
+    #[tokio::test]
+    async fn streams_manager_activity() {
+        let script = r##"case "$1" in
+            *"no prose"*)
+              echo '{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"thinking_delta","estimated_tokens":30}}}'
+              echo '{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Read","input":{"file_path":"notes.md"}}]}}'
+              echo '{"type":"result","is_error":false,"result":"[{"worker": "coder", "task": "go"}]"}' ;;
+            *) echo '{"type":"result","is_error":false,"result":"All done."}' ;;
+            esac"##;
+        let crew = Crew {
+            max_rounds: 2,
+            // $0 is "stream-json", which marks the command as streaming
+            manager: format!("sh -c {} stream-json {{prompt}}", shlex::try_quote(script).unwrap()),
+            worker: "echo DID {prompt}".into(),
+            max_parallel: 4,
+            worker_timeout_mins: 1,
+        };
+        let (tx, mut rx) = unbounded_channel();
+        orchestrate(crew, "ship it".into(), String::new(), tx).await;
+        let mut msgs = vec![];
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+        assert!(msgs.iter().any(|m| matches!(m, Msg::Thinking(30))));
+        assert!(chat(&msgs).contains("→ Read notes.md") && chat(&msgs).contains("All done."));
+        assert!(workers(&msgs).contains(&("coder", State::Done)));
     }
 
     #[test]
@@ -431,6 +546,8 @@ mod tests {
     fn manager_prompt_carries_history_and_delegates() {
         let p = manager_prompt("fix it", "User: hi\nManager: hello");
         assert!(p.contains("User: hi") && p.contains("create workers") && p.contains("do not do"));
+        assert!(p.contains("same file"));
+        assert!(review_prompt("g", "r", false).contains("check the actual files"));
     }
 
     /// Fake manager: invents coder, then on review a checker for round 2, then says done

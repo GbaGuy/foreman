@@ -83,6 +83,8 @@ struct App {
     chat: Vec<(Kind, String)>,
     workers: Vec<Worker>,
     manager: Option<State>,
+    thinking: Option<u64>, // rough tokens the manager has spent thinking on its current call
+    live: String,          // the manager's reply as it streams in
     scroll_back: u16, // lines scrolled up from the bottom of the chat
     input: String,
     cursor: usize, // in chars
@@ -116,7 +118,9 @@ impl App {
     fn handle(&mut self, msg: Msg) {
         match msg {
             Msg::Log(kind, text) => self.chat.push((kind, text)),
-            Msg::Manager(state) => self.manager = Some(state),
+            Msg::Manager(state) => (self.manager, self.thinking, self.live) = (Some(state), None, String::new()),
+            Msg::Thinking(n) => self.thinking = Some(self.thinking.unwrap_or(0) + n),
+            Msg::ManagerText(text) => self.live.push_str(&text),
             Msg::Worker(name, role, state) => {
                 let i = match self.workers.iter().position(|w| w.name == name) {
                     Some(i) => i,
@@ -319,15 +323,8 @@ impl App {
     // ---- drawing --------------------------------------------------------------
     fn draw(&self, f: &mut Frame) {
         let t = self.t();
-        let strip = if self.workers.is_empty() { 0 } else { self.workers.len().min(6) as u16 + 2 };
-        let [header, body, workers, input, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(5),
-            Constraint::Length(strip),
-            Constraint::Length(3),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
+        let [header, body, input, footer] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(5), Constraint::Length(3), Constraint::Length(1)]).areas(f.area());
 
         let status = if self.busy {
             Span::styled(format!(" {} working ", self.spinner()), Style::new().fg(t.warn))
@@ -343,15 +340,18 @@ impl App {
         );
         f.render_widget(Line::from(status).right_aligned(), header);
 
-        self.draw_chat(f, body);
-        if strip > 0 {
-            self.draw_workers(f, workers);
+        if self.workers.is_empty() {
+            self.draw_chat(f, body);
+        } else {
+            let [chat, grid] = Layout::vertical([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(body);
+            self.draw_chat(f, chat);
+            self.draw_workers(f, grid);
         }
         self.draw_input(f, input);
 
         let mut keys = vec![("^O", "manager model"), ("^W", "worker model")];
         if !self.workers.is_empty() {
-            keys.push(("Tab", "worker output"));
+            keys.push(("Tab", "full output"));
         }
         if self.busy {
             keys.push(("^S", "stop"));
@@ -416,7 +416,12 @@ impl App {
         if self.busy && self.manager == Some(State::Working) {
             title.extend([self.icon(State::Working), Span::styled(" thinking ", Style::new().fg(t.warn))]);
         }
-        let block = Block::bordered().border_type(BorderType::Rounded).border_style(Style::new().fg(t.primary)).title(Line::from(title));
+        let workers_model = crew::model_of(&self.crew.worker).unwrap_or("default model");
+        let block = Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(t.primary))
+            .title(Line::from(title))
+            .title_bottom(Line::styled(format!(" workers run on {workers_model} "), Style::new().fg(t.dim)).right_aligned());
         let inner = block.inner(area).inner(Margin::new(1, 0));
         f.render_widget(block, area);
 
@@ -432,6 +437,7 @@ impl App {
                 .filter_map(|(kind, text)| match kind {
                     Kind::Out => markdown(text, &mut in_code, t),
                     Kind::User => Some(Line::styled(text.clone(), Style::new().fg(t.accent).bold())),
+                    Kind::Think => Some(Line::styled(text.clone(), Style::new().fg(t.dim).italic())),
                     Kind::Info => Some(Line::styled(text.clone(), Style::new().fg(t.secondary))),
                     Kind::Good => Some(Line::styled(text.clone(), Style::new().fg(t.good))),
                     Kind::Warn => Some(Line::styled(text.clone(), Style::new().fg(t.warn))),
@@ -439,33 +445,76 @@ impl App {
                 })
                 .collect()
         };
+        let mut lines = lines;
+        lines.extend(self.live_lines());
         render_scrolled(f, lines, inner, self.scroll_back);
     }
 
+    /// The manager's in-progress call: a thinking line, then its reply as it streams.
+    fn live_lines(&self) -> Vec<Line<'static>> {
+        let t = self.t();
+        if !(self.busy && self.manager == Some(State::Working)) {
+            return vec![];
+        }
+        let mut lines = vec![];
+        let thought = self.thinking.map(|n| format!(" (~{n} tokens)")).unwrap_or_default();
+        let status = match (self.thinking.is_some(), self.live.is_empty()) {
+            (_, false) => format!("💭 thought{thought}, writing…"),
+            (true, true) => format!("{} 💭 thinking{thought}…", self.spinner()),
+            (false, true) => format!("{} reading…", self.spinner()),
+        };
+        lines.push(Line::styled(status, Style::new().fg(t.warn).italic()));
+        lines.extend(self.live.lines().map(|l| Line::styled(l.to_string(), Style::new().fg(t.dim))));
+        lines
+    }
+
+    /// A live pane per worker: busy ones first, then the newest, up to six. Tab shows any of them in full.
     fn draw_workers(&self, f: &mut Frame, area: Rect) {
         let t = self.t();
-        let model = crew::model_of(&self.crew.worker).unwrap_or("default model");
-        let block = Block::bordered()
-            .border_type(BorderType::Rounded)
-            .border_style(Style::new().fg(t.secondary))
-            .title(Line::from(vec![Span::styled(" workers ", Style::new().fg(t.accent).bold()), Span::styled(format!("· {model} "), Style::new().fg(t.dim))]));
-        let inner = block.inner(area).inner(Margin::new(1, 0));
-        f.render_widget(block, area);
-        let skip = self.workers.len().saturating_sub(6); // newest workers stay visible
-        let shown = &self.workers[skip..];
-        let names: Vec<Line> = shown
-            .iter()
-            .map(|w| {
-                Line::from(vec![
-                    self.icon(w.state),
-                    Span::styled(format!(" {:<14}", w.name), Style::new().fg(t.text).bold()),
-                    Span::styled(w.role.clone(), Style::new().fg(t.dim)),
-                ])
-            })
-            .collect();
-        let times: Vec<Line> = shown.iter().map(|w| Line::styled(fmt_duration(w.elapsed()), Style::new().fg(t.dim)).right_aligned()).collect();
-        f.render_widget(Paragraph::new(names), inner);
-        f.render_widget(Paragraph::new(times), inner);
+        let mut shown: Vec<usize> = (0..self.workers.len()).collect();
+        shown.sort_by_key(|&i| (self.workers[i].state != State::Working, std::cmp::Reverse(i)));
+        shown.truncate(6);
+        shown.sort();
+        let n = shown.len();
+        let cols = match n {
+            1 => 1,
+            2..=4 => 2,
+            _ => 3,
+        };
+        let rows = n.div_ceil(cols);
+        let row_areas = Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
+        for (r, row) in row_areas.iter().enumerate() {
+            let in_row = (n - r * cols).min(cols);
+            let cells = Layout::horizontal(vec![Constraint::Ratio(1, in_row as u32); in_row]).split(*row);
+            for (c, cell) in cells.iter().enumerate() {
+                let w = &self.workers[shown[r * cols + c]];
+                let color = match w.state {
+                    State::Working => t.warn,
+                    State::Done => t.good,
+                    State::Failed => t.bad,
+                };
+                let block = Block::bordered()
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::new().fg(color))
+                    .title(Line::from(vec![
+                        Span::raw(" "),
+                        self.icon(w.state),
+                        Span::styled(format!(" {} ", w.name), Style::new().fg(t.text).bold()),
+                        Span::styled(format!("· {} ", w.role), Style::new().fg(t.dim)),
+                    ]))
+                    .title_top(Line::styled(format!(" {} ", fmt_duration(w.elapsed())), Style::new().fg(t.dim)).right_aligned());
+                let inner = block.inner(*cell).inner(Margin::new(1, 0));
+                f.render_widget(block, *cell);
+                // only the tail matters in a pane, and wrapping thousands of lines every frame is slow
+                let tail = &w.output[w.output.len().saturating_sub(200)..];
+                let lines: Vec<Line> = if tail.is_empty() {
+                    vec![Line::styled("starting…", Style::new().fg(t.dim).italic())]
+                } else {
+                    tail.iter().map(|l| Line::styled(l.as_str(), Style::new().fg(t.text))).collect()
+                };
+                render_scrolled(f, lines, inner, 0);
+            }
+        }
     }
 
     fn draw_viewer(&self, f: &mut Frame, v: &Viewer) {
@@ -636,6 +685,8 @@ fn main() -> std::io::Result<()> {
         chat: Vec::new(),
         workers: Vec::new(),
         manager: None,
+        thinking: None,
+        live: String::new(),
         scroll_back: 0,
         input: String::new(),
         cursor: 0,
